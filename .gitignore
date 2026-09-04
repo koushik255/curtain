@@ -1,0 +1,57 @@
+# Source images and manually selected training/evaluation data
+/screenshots/
+/selected_screenshots/
+/testing/
+
+# Generated embedding indexes and training outputs
+/index/
+/index-*/
+/trained_indexes/
+/trained_models/
+/training_runs/
+/runs/
+/models/
+*.npy
+*.npz
+*.pt
+*.pth
+*.ckpt
+*.onnx
+
+# Website/Sites files that should remain local
+/web/
+/.openai/
+
+# Python environments, caches, coverage, and tooling
+/.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Rust build products
+/target/
+
+# Local configuration, credentials, and logs
+.env
+.env.*
+!.env.example
+*.log
+*.pid
+
+# Editors and operating systems
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Codex-local metadata
+/.agents/
+/.codex/

@@ -1,0 +1,16 @@
+[project]
+name = "curtain-search"
+version = "0.1.0"
+description = "Local SSCD reverse search for movie screenshots"
+requires-python = ">=3.12"
+dependencies = [
+    "flask>=3.1,<4",
+    "modal>=1.5,<2",
+    "numpy>=2.2,<3",
+    "pillow>=11,<13",
+    "torch>=2.8,<3",
+    "torchvision>=0.23,<1",
+]
+
+[tool.uv]
+package = false

@@ -1,0 +1,13 @@
+[Unit]
+Description=Curtain trained-model private screenshot search
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/koushik/curtain
+ExecStart=/home/koushik/curtain/.venv/bin/python -u -m training.server --host 127.0.0.1 --port 8781 --device cpu
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target
