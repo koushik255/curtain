@@ -115,20 +115,30 @@ class RandomGamma:
         )
 
 
-def training_transform(image_size: int, lighting_preset: str = "legacy") -> transforms.Compose:
+def training_transform(
+    image_size: int, lighting_preset: str = "legacy"
+) -> transforms.Compose:
     """Mild transformations that define what Curtain considers the same frame."""
     if lighting_preset not in ("legacy", "lighting-v1", "crop-v1"):
         raise ValueError(f"Unknown lighting preset: {lighting_preset}")
     if lighting_preset == "crop-v1":
-        return transforms.Compose([RandomFrameCrop(), training_transform(image_size, "lighting-v1")])
+        return transforms.Compose(
+            [RandomFrameCrop(), training_transform(image_size, "lighting-v1")]
+        )
     if lighting_preset == "lighting-v1":
-        return transforms.Compose([
-            transforms.Resize((image_size, image_size), antialias=True),
-            RandomLighting(),
-            transforms.RandomApply([transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 0.8))], p=0.2),
-            RandomResolutionDegradation(), RandomJpegCompression(),
-            transforms.ToTensor(), transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
-        ])
+        return transforms.Compose(
+            [
+                transforms.Resize((image_size, image_size), antialias=True),
+                RandomLighting(),
+                transforms.RandomApply(
+                    [transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 0.8))], p=0.2
+                ),
+                RandomResolutionDegradation(),
+                RandomJpegCompression(),
+                transforms.ToTensor(),
+                transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
+            ]
+        )
     return transforms.Compose(
         [
             transforms.Resize((image_size, image_size), antialias=True),
@@ -200,11 +210,16 @@ def select_paths(
 
 
 class PositivePairDataset(Dataset):
-    def __init__(self, paths: list[Path], image_size: int, lighting_preset: str = "legacy"):
+    def __init__(
+        self, paths: list[Path], image_size: int, lighting_preset: str = "legacy"
+    ):
         self.paths = paths
         self.transform = training_transform(image_size, lighting_preset)
-        self.anchor_transform = (training_transform(image_size, "lighting-v1")
-                                 if lighting_preset == "crop-v1" else self.transform)
+        self.anchor_transform = (
+            training_transform(image_size, "lighting-v1")
+            if lighting_preset == "crop-v1"
+            else self.transform
+        )
 
     def __len__(self) -> int:
         return len(self.paths)
@@ -419,7 +434,11 @@ def parse_args() -> TrainingConfig:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--limit", type=int)
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
-    parser.add_argument("--lighting-preset", choices=("legacy", "lighting-v1", "crop-v1"), default="legacy")
+    parser.add_argument(
+        "--lighting-preset",
+        choices=("legacy", "lighting-v1", "crop-v1"),
+        default="legacy",
+    )
     args = parser.parse_args()
     return TrainingConfig(
         data_dir=str(args.data),

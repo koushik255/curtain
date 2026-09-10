@@ -1,6 +1,6 @@
 # Source images and manually selected training/evaluation data
 /screenshots/
-/selected_screenshots/
+/selected_screenshots*/
 /testing/
 
 # Generated embedding indexes and training outputs
