@@ -16,6 +16,8 @@ from torch import nn
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 from torchvision.models import resnet18
+from training.lighting import RandomLighting
+from training.framing import RandomFrameCrop
 
 
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp"}
@@ -39,6 +41,7 @@ class TrainingConfig:
     seed: int = 42
     limit: int | None = None
     device: str = "auto"
+    lighting_preset: str = "legacy"
 
 
 class RandomJpegCompression:
@@ -46,7 +49,7 @@ class RandomJpegCompression:
 
     def __init__(
         self,
-        minimum_quality: int = 65,
+        minimum_quality: int = 45,
         maximum_quality: int = 95,
         probability: float = 0.7,
     ):
@@ -68,15 +71,71 @@ class RandomJpegCompression:
             return compressed.convert("RGB")
 
 
-def training_transform(image_size: int) -> transforms.Compose:
+class RandomResolutionDegradation:
+    """Simulate an online image that was reduced and then enlarged again."""
+
+    def __init__(self, minimum_scale: float = 0.45, probability: float = 0.5):
+        self.minimum_scale = minimum_scale
+        self.probability = probability
+
+    def __call__(self, image: Image.Image) -> Image.Image:
+        if random.random() >= self.probability:
+            return image
+        width, height = image.size
+        scale = random.uniform(self.minimum_scale, 0.9)
+        reduced = image.resize(
+            (max(1, round(width * scale)), max(1, round(height * scale))),
+            resample=random.choice(
+                (Image.Resampling.BILINEAR, Image.Resampling.BICUBIC)
+            ),
+        )
+        return reduced.resize(
+            (width, height),
+            resample=random.choice(
+                (Image.Resampling.BILINEAR, Image.Resampling.BICUBIC)
+            ),
+        )
+
+
+class RandomGamma:
+    """Apply a modest nonlinear brightness change seen in online encodes."""
+
+    def __init__(
+        self, minimum: float = 0.8, maximum: float = 1.2, probability: float = 0.35
+    ):
+        self.minimum = minimum
+        self.maximum = maximum
+        self.probability = probability
+
+    def __call__(self, image: Image.Image) -> Image.Image:
+        if random.random() >= self.probability:
+            return image
+        return transforms.functional.adjust_gamma(
+            image, random.uniform(self.minimum, self.maximum)
+        )
+
+
+def training_transform(image_size: int, lighting_preset: str = "legacy") -> transforms.Compose:
     """Mild transformations that define what Curtain considers the same frame."""
+    if lighting_preset not in ("legacy", "lighting-v1", "crop-v1"):
+        raise ValueError(f"Unknown lighting preset: {lighting_preset}")
+    if lighting_preset == "crop-v1":
+        return transforms.Compose([RandomFrameCrop(), training_transform(image_size, "lighting-v1")])
+    if lighting_preset == "lighting-v1":
+        return transforms.Compose([
+            transforms.Resize((image_size, image_size), antialias=True),
+            RandomLighting(),
+            transforms.RandomApply([transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 0.8))], p=0.2),
+            RandomResolutionDegradation(), RandomJpegCompression(),
+            transforms.ToTensor(), transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
+        ])
     return transforms.Compose(
         [
             transforms.Resize((image_size, image_size), antialias=True),
             transforms.RandomApply(
                 [
                     transforms.ColorJitter(
-                        brightness=0.15, contrast=0.15, saturation=0.1
+                        brightness=0.25, contrast=0.25, saturation=0.15
                     )
                 ],
                 p=0.8,
@@ -85,6 +144,8 @@ def training_transform(image_size: int) -> transforms.Compose:
                 [transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 0.8))],
                 p=0.2,
             ),
+            RandomGamma(),
+            RandomResolutionDegradation(),
             RandomJpegCompression(),
             transforms.ToTensor(),
             transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
@@ -139,9 +200,11 @@ def select_paths(
 
 
 class PositivePairDataset(Dataset):
-    def __init__(self, paths: list[Path], image_size: int):
+    def __init__(self, paths: list[Path], image_size: int, lighting_preset: str = "legacy"):
         self.paths = paths
-        self.transform = training_transform(image_size)
+        self.transform = training_transform(image_size, lighting_preset)
+        self.anchor_transform = (training_transform(image_size, "lighting-v1")
+                                 if lighting_preset == "crop-v1" else self.transform)
 
     def __len__(self) -> int:
         return len(self.paths)
@@ -149,7 +212,7 @@ class PositivePairDataset(Dataset):
     def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor]:
         with Image.open(self.paths[index]) as image:
             source = ImageOps.exif_transpose(image).convert("RGB")
-        return self.transform(source), self.transform(source)
+        return self.anchor_transform(source), self.transform(source)
 
 
 class RetrievalDataset(Dataset):
@@ -267,7 +330,7 @@ def train(config: TrainingConfig) -> dict[str, float]:
         "persistent_workers": config.workers > 0,
     }
     train_loader = DataLoader(
-        PositivePairDataset(train_paths, config.image_size),
+        PositivePairDataset(train_paths, config.image_size, config.lighting_preset),
         shuffle=True,
         drop_last=True,
         **loader_kwargs,
@@ -356,6 +419,7 @@ def parse_args() -> TrainingConfig:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--limit", type=int)
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
+    parser.add_argument("--lighting-preset", choices=("legacy", "lighting-v1", "crop-v1"), default="legacy")
     args = parser.parse_args()
     return TrainingConfig(
         data_dir=str(args.data),
@@ -372,6 +436,7 @@ def parse_args() -> TrainingConfig:
         seed=args.seed,
         limit=args.limit,
         device=args.device,
+        lighting_preset=args.lighting_preset,
     )
 
 

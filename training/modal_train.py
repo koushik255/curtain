@@ -33,13 +33,27 @@ def train_on_l4(
     image_size: int = 192,
     workers: int = 8,
     run_name: str = "l4-baseline",
+    data_name: str = "selected_screenshots",
+    archive_name: str | None = None,
     limit: int | None = None,
+    lighting_preset: str = "legacy",
 ) -> dict[str, float]:
+    import tarfile
+    from pathlib import Path
+
     from training.train import TrainingConfig, train
+
+    data_dir = f"/data/{data_name}"
+    if archive_name is not None:
+        extracted = Path("/tmp/curtain-training-data")
+        extracted.mkdir(parents=True, exist_ok=True)
+        with tarfile.open(f"/data/datasets/{archive_name}") as archive:
+            archive.extractall(extracted, filter="data")
+        data_dir = str(extracted)
 
     metrics = train(
         TrainingConfig(
-            data_dir="/data/selected_screenshots",
+            data_dir=data_dir,
             output_dir=f"/data/runs/{run_name}",
             epochs=epochs,
             batch_size=batch_size,
@@ -47,6 +61,7 @@ def train_on_l4(
             workers=workers,
             limit=limit,
             device="cuda",
+            lighting_preset=lighting_preset,
         )
     )
     volume.commit()
@@ -60,7 +75,10 @@ def main(
     image_size: int = 192,
     workers: int = 8,
     run_name: str = "l4-smoke",
+    data_name: str = "selected_screenshots",
+    archive_name: str | None = None,
     limit: int | None = None,
+    lighting_preset: str = "legacy",
 ) -> None:
     metrics = train_on_l4.remote(
         epochs=epochs,
@@ -68,6 +86,9 @@ def main(
         image_size=image_size,
         workers=workers,
         run_name=run_name,
+        data_name=data_name,
+        archive_name=archive_name,
         limit=limit,
+        lighting_preset=lighting_preset,
     )
     print(metrics)

@@ -9,6 +9,7 @@ import torch
 from PIL import Image, ImageOps
 
 from training.train import CurtainEncoder, reference_transform
+from training.scoring import normalize_rows
 
 
 def search(
@@ -37,15 +38,14 @@ def search(
         image = ImageOps.exif_transpose(image).convert("RGB")
     query = reference_transform(int(config["image_size"]))(image).unsqueeze(0)
     with torch.inference_mode():
-        query_embedding = model(query.to(device))[0].float().cpu().numpy()
+        query_embedding = normalize_rows(model(query.to(device)).float().cpu().numpy())[0]
 
-    embeddings = np.load(index_dir / "embeddings.npy").astype(np.float32)
+    embeddings = normalize_rows(np.load(index_dir / "embeddings.npy"))
     records = json.loads((index_dir / "records.json").read_text())
     if len(embeddings) != len(records):
         raise RuntimeError("The embedding matrix and records file have different lengths.")
 
-    # Model outputs and stored vectors are L2-normalized, so their dot product
-    # is cosine similarity.
+    # Re-normalize after float16 storage rounding so the dot product is cosine.
     scores = embeddings @ query_embedding
     count = min(max(top_k, 1), len(scores))
     best = np.argpartition(scores, -count)[-count:]
