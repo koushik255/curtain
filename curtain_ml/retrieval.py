@@ -3,7 +3,7 @@ import numpy as np
 
 
 def normalize_rows(matrix: np.ndarray) -> np.ndarray:
-    """Return normalized float32 rows without modifying the input/index on disk."""
+    # Return normalized float32 rows without modifying the input/index on disk.
     result = np.array(matrix, dtype=np.float32, copy=True)
     if result.ndim != 2 or not np.isfinite(result).all():
         raise ValueError('Expected a finite two-dimensional embedding matrix')

@@ -1,11 +1,11 @@
-import random
 import unittest
 import numpy as np
 import torch
 from PIL import Image
 
 from curtain_ml.augmentations import LightingConfig, RandomLighting
-from curtain_ml.training import CurtainEncoder, contrastive_loss, training_transform
+from curtain_ml.model import CurtainEncoder
+from curtain_ml.training import contrastive_loss, training_transform
 
 
 class LightingTests(unittest.TestCase):
@@ -36,19 +36,9 @@ class LightingTests(unittest.TestCase):
                        {'gamma': (0, 1)}, {'temperature_strength': 0.5}):
             with self.assertRaises(ValueError):
                 LightingConfig(**kwargs)
-        with self.assertRaises(ValueError):
-            training_transform(32, 'unknown')
-
-    def test_legacy_default_unchanged(self):
-        random.seed(3); torch.manual_seed(3)
-        first = training_transform(32)(self.image)
-        random.seed(3); torch.manual_seed(3)
-        second = training_transform(32, 'legacy')(self.image)
-        torch.testing.assert_close(first, second)
-
     def test_training_step(self):
         torch.set_num_threads(2)
-        transform = training_transform(32, 'lighting-v1')
+        transform = training_transform(32)
         first = torch.stack([transform(self.image) for _ in range(2)])
         second = torch.stack([transform(self.image) for _ in range(2)])
         self.assertEqual(first.shape, (2, 3, 32, 32))

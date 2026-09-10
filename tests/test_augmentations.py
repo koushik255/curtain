@@ -2,7 +2,8 @@ import unittest
 import torch
 from PIL import Image
 from curtain_ml.augmentations import RandomFrameCrop
-from curtain_ml.training import PositivePairDataset, training_transform, CurtainEncoder, contrastive_loss
+from curtain_ml.model import CurtainEncoder
+from curtain_ml.training import PositivePairDataset, training_transform, contrastive_loss
 
 
 class FramingTests(unittest.TestCase):
@@ -23,12 +24,12 @@ class FramingTests(unittest.TestCase):
 
     def test_anchor_and_step(self):
         torch.set_num_threads(2)
-        dataset=PositivePairDataset([],32,'crop-v1')
-        self.assertIsInstance(dataset.transform.transforms[0],RandomFrameCrop)
+        dataset=PositivePairDataset([],32)
+        self.assertIsInstance(dataset.positive_transform.transforms[0],RandomFrameCrop)
         self.assertFalse(any(isinstance(t,RandomFrameCrop) for t in dataset.anchor_transform.transforms))
         image=Image.new('RGB',(160,90),(80,120,180))
         a=torch.stack([dataset.anchor_transform(image) for _ in range(2)])
-        b=torch.stack([dataset.transform(image) for _ in range(2)])
+        b=torch.stack([dataset.positive_transform(image) for _ in range(2)])
         model=CurtainEncoder(128)
         loss=contrastive_loss(model(a),model(b),.07)
         self.assertTrue(torch.isfinite(loss))

@@ -29,39 +29,26 @@ training_image = (
 )
 def train_on_l4(
     epochs: int = 20,
-    batch_size: int = 128,
-    image_size: int = 192,
-    workers: int = 8,
-    run_name: str = "l4-baseline",
-    data_name: str = "selected_screenshots",
-    archive_name: str | None = None,
-    limit: int | None = None,
-    lighting_preset: str = "legacy",
+    run_name: str = "l4-crop",
+    archive_name: str = "curtain-selected-screenshots-50k.tar",
 ) -> dict[str, float]:
+    # Extract the training archive, train on one L4, and commit the run.
     import tarfile
     from pathlib import Path
 
     from curtain_ml.training import TrainingConfig, train
 
-    data_dir = f"/data/{data_name}"
-    if archive_name is not None:
-        extracted = Path("/tmp/curtain-training-data")
-        extracted.mkdir(parents=True, exist_ok=True)
-        with tarfile.open(f"/data/datasets/{archive_name}") as archive:
-            archive.extractall(extracted, filter="data")
-        data_dir = str(extracted)
+    data_dir = Path("/tmp/curtain-training-data")
+    data_dir.mkdir(parents=True, exist_ok=True)
+    with tarfile.open(f"/data/datasets/{archive_name}") as archive:
+        archive.extractall(data_dir, filter="data")
 
     metrics = train(
         TrainingConfig(
-            data_dir=data_dir,
+            data_dir=str(data_dir),
             output_dir=f"/data/runs/{run_name}",
             epochs=epochs,
-            batch_size=batch_size,
-            image_size=image_size,
-            workers=workers,
-            limit=limit,
-            device="cuda",
-            lighting_preset=lighting_preset,
+            batch_size=128,
         )
     )
     volume.commit()
@@ -71,24 +58,13 @@ def train_on_l4(
 @app.local_entrypoint()
 def main(
     epochs: int = 5,
-    batch_size: int = 128,
-    image_size: int = 192,
-    workers: int = 8,
     run_name: str = "l4-smoke",
-    data_name: str = "selected_screenshots",
-    archive_name: str | None = None,
-    limit: int | None = None,
-    lighting_preset: str = "legacy",
+    archive_name: str = "curtain-selected-screenshots-50k.tar",
 ) -> None:
+    # Launch the Modal training function with the compact CLI configuration.
     metrics = train_on_l4.remote(
         epochs=epochs,
-        batch_size=batch_size,
-        image_size=image_size,
-        workers=workers,
         run_name=run_name,
-        data_name=data_name,
         archive_name=archive_name,
-        limit=limit,
-        lighting_preset=lighting_preset,
     )
     print(metrics)

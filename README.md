@@ -1,190 +1,64 @@
-# curtain
+# Curtain
 
-Curtain combines a Rust movie-frame extractor with Python image-search models.
-The original SSCD pipeline lives in `src/`; the contrastively trained model is
-implemented in `curtain_ml/`. Remote GPU jobs, benchmarks, applications, and
-tests are kept in `cloud/`, `benchmarks/`, `apps/`, and `tests/` respectively.
-See `docs/training.md` for the trained-model workflow.
-
-## Project layout
+Curtain finds the closest indexed movie frame to a supplied image. It has four
+parts:
 
 ```text
-apps/         Runnable web applications and their templates
-benchmarks/   Repeatable accuracy and robustness evaluations
-cloud/        Modal training, indexing, and benchmark jobs
-curtain_ml/   Reusable model, augmentation, training, and retrieval code
-docs/         Longer workflow documentation
-experiments/  One-off investigations kept outside the production package
-scripts/      Small local command-line utilities
-src/          Rust extractor and the original SSCD implementation
-tests/        Fast automated tests
+src/main.rs          Extract movie frames with FFmpeg
+curtain_ml/          Train the encoder and build indexes
+cloud/               Run training and indexing on Modal L4 GPUs
+apps/                Serve the private search site
 ```
 
-Large local datasets and generated artifacts remain in the ignored
-`screenshots/`, `selected_screenshots*`, `trained_models/`, and
-`trained_indexes/` directories so the running services keep stable paths.
+The encoder is a ResNet-18 trained from scratch with contrastive learning. Two
+altered views of the same frame form a positive pair; all other frames in the
+batch are negatives. The current augmentation recipe changes crop, lighting,
+resolution, blur, and JPEG quality. The resulting 128-value embeddings are
+L2-normalized, so search is a matrix-vector dot product (cosine similarity).
 
-A Rust command-line program that uses FFmpeg to save one JPEG screenshot every 0.5 seconds (2 frames per second) from movies. Screenshots are scaled down to a maximum width of 1280 pixels without enlarging smaller videos, and use moderate JPEG quality for faster processing and smaller files.
+Large inputs and outputs are intentionally ignored by Git: `screenshots/`,
+`selected_screenshots*`, `trained_models/`, and `trained_indexes/`.
 
-## Requirements
+## Extract frames
 
-- Rust
-- `ffmpeg` available on your `PATH`
-
-## Process your Movies directory
-
-Running without arguments scans `~/Downloads/Movies`:
+The Rust extractor samples every movie at 2 fps, scales frames to at most 1280
+pixels wide, and writes JPEGs to `screenshots/<movie>/`:
 
 ```sh
-cargo run --release
+cargo run --release -- --check /path/to/movies /home/koushik/curtain/screenshots
 ```
 
-It processes movie files directly in that directory and files one directory deeper. It does not recurse further. Supported extensions include MP4, MKV, AVI, MOV, WebM, M4V, MPG, MPEG, WMV, and FLV.
+It scans the given directory and its immediate subdirectories. Two movies run
+in parallel by default; set `CURTAIN_JOBS` to change that. Existing frame
+sequences are resumed.
 
-Screenshots are placed in `~/curtain/screenshots/<movie-name>/`, whether the movie is directly in the Movies directory or in an immediate subdirectory:
+## Train and index
 
-```text
-~/Downloads/Movies/film.mp4        -> ~/curtain/screenshots/film/frame_000001.jpg
-~/Downloads/Movies/Action/film.mkv -> ~/curtain/screenshots/film/frame_000001.jpg
-```
-
-The terminal shows a live frame counter for each active movie and an overall completed-movies counter. Frames are written immediately. If the program is interrupted, running it again resumes each unfinished movie from its existing numbered JPEGs (and safely recreates the last frame in case it was only partially written).
-
-Movies are processed two at a time by default using Rayon. Change the parallelism with `CURTAIN_JOBS`:
-
-```sh
-CURTAIN_JOBS=4 cargo run --release
-```
-
-FFmpeg already decodes each movie as one sequential pass, which is more efficient than launching a separate FFmpeg process for every timestamp.
-
-## Check before running
-
-Use `--check` to list every discovered movie and wait for confirmation:
-
-```sh
-cargo run --release -- --check
-```
-
-The first `--` is required because `--check` must be passed through Cargo to the program. Enter `y` or `yes` to proceed; any other answer cancels.
-
-## Other paths
-
-Scan another directory and optionally choose an output root:
-
-```sh
-cargo run --release -- /path/to/movies
-cargo run --release -- --check /path/to/movies /path/to/output
-```
-
-A single movie is also supported:
-
-```sh
-cargo run --release -- movie.mp4
-```
-
-Build a standalone executable with:
-
-```sh
-cargo build --release
-./target/release/curtain --check
-```
-
-## Build the movie-search index
-
-The search side uses the same SSCD copy-detection model as `fig`, adapted for
-movie frames. The extractor retains screenshots at 2 fps; the indexer uses every
-other screenshot to create one embedding per second and groups search results by
-movie. Indexing is resumable and each finished movie is kept separately, so
-adding another movie does not rebuild the existing movies.
-
-SSCD produces 32-bit descriptors, but Curtain stores them as 16-bit floats by
-default and promotes them back to 32-bit for similarity calculations. Combined
-with 1 fps sampling, this cuts the current collection's embedding storage from
-roughly 1.1 GiB to about 280 MiB with negligible quantization loss. Pass
-`--dtype float32` if full-precision storage is preferred.
-
-Install the Python dependencies and build the index:
+Install the Python environment and run tests:
 
 ```sh
 uv sync
-uv run python -m src.index
+uv run python -m unittest discover -s tests
 ```
 
-The first run downloads the official `sscd_disc_mixup` checkpoint. On this
-machine SSCD will use CUDA or MPS when available and otherwise use the CPU. The
-indexer checkpoints after every batch, so it is safe to stop and rerun the same
-command. Existing completed movies are skipped.
-
-Useful indexing options include:
+Training and indexing intentionally require CUDA. They run on Modal L4s:
 
 ```sh
-# Index just one matching movie folder
-uv run python -m src.index --movie Matrix
-
-# Tune memory use or accelerator throughput
-uv run python -m src.index --batch-size 64
-
-# A safe second worker can traverse from the opposite end
-uv run python -m src.index --reverse
-
-# Build a tiny disposable test index
-uv run python -m src.index --limit 100 --output /tmp/curtain-test-index
+.venv/bin/modal run cloud/train.py --epochs 20 --run-name my-run
+.venv/bin/modal run cloud/index.py --dry-run
+.venv/bin/modal run cloud/index.py
 ```
 
-Use `--force` only when a selected movie or incompatible partial index should be
-rebuilt.
+See [docs/training.md](docs/training.md) for the data and artifact flow.
 
-## Search
+## Search site
 
-Search directly from the terminal:
+The local server loads the crop-v1 checkpoint and both verified index
+collections:
 
 ```sh
-uv run python -m src.search /path/to/query.jpg
+uv run python -m apps.server --host 127.0.0.1 --port 8781
 ```
 
-The results show distinct movies, their strongest matching frame, the estimated
-timestamp, and the SSCD similarity score.
-
-## Current search pipeline
-
-Curtain does not crop the images. The extractor first saves frames at 2 fps and
-scales wide frames down to at most 1280 pixels. The indexer selects every other
-saved frame, giving the current index a 1 fps sampling rate. Each selected frame
-is converted to RGB, resized directly to 320 by 320 pixels, normalized, and sent
-through `sscd_disc_mixup`. SSCD returns an L2-normalized 512-dimensional float32
-descriptor, which Curtain stores as float16.
-
-At query time Curtain performs the same resize and normalization, computes one
-float32 SSCD descriptor, and compares it with all 286,967 stored descriptors by
-dot product. Because the descriptors are normalized, this is cosine similarity.
-The current implementation uses NumPy matrix multiplication over one shard per
-movie; it does not currently use FAISS or an approximate-nearest-neighbor index.
-
-## Experimental INT8 SSCD
-
-The isolated experiment statically quantizes the SSCD network, calibrates it
-with one test image per movie, and evaluates it with the other image. It does
-not change the model used by the web service:
-
-```sh
-uv run python experiments/quantize_sscd.py
-```
-
-The generated experimental model is written under `models/`, which is ignored
-by Git. The benchmark reports model size, FP32 and INT8 forward latency,
-descriptor agreement, top-1 movie accuracy, and exact-frame agreement against
-the existing index.
-
-## Private web interface
-
-Run the upload, drag-and-drop, and clipboard-paste interface locally with:
-
-```sh
-uv run python -m src.server
-```
-
-The persistent installation is available to this machine's Tailscale network at
-`https://kouskous.tail90d2bb.ts.net:8443`. It uses a separate HTTPS port and
-does not modify the existing StopAndGo route on port 443.
-# curtain
+Tailscale Serve exposes it privately on the tailnet at port 8444. The retired
+8443 service is not part of this repository.

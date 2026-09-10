@@ -10,6 +10,7 @@ from curtain_ml.training import IMAGE_SUFFIXES
 
 
 def evenly_spaced(paths: list[Path], count: int) -> list[Path]:
+    # Choose evenly spaced frames while preserving the movie's time span.
     if count >= len(paths):
         return paths
     if count == 1:
@@ -18,6 +19,7 @@ def evenly_spaced(paths: list[Path], count: int) -> list[Path]:
 
 
 def select_frames(source: Path, destination: Path, total: int) -> dict:
+    # Create a balanced, reproducible-by-filename frame subset across movies.
     movies = {
         directory.name: sorted(
             path for path in directory.iterdir() if path.suffix.lower() in IMAGE_SUFFIXES
@@ -70,6 +72,7 @@ def select_frames(source: Path, destination: Path, total: int) -> dict:
 
 
 def parse_args() -> argparse.Namespace:
+    # Parse the command-line options for frame-set creation.
     parser = argparse.ArgumentParser(description="Select balanced, evenly spaced movie frames.")
     parser.add_argument("--source", type=Path, default=Path("screenshots"))
     parser.add_argument("--output", type=Path, default=Path("selected_screenshots_50k"))

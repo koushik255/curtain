@@ -15,8 +15,8 @@ from PIL import Image, ImageOps
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
-from torchvision.models import resnet18
 from curtain_ml.augmentations import RandomFrameCrop, RandomLighting
+from curtain_ml.model import CurtainEncoder
 
 
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp"}
@@ -26,6 +26,7 @@ IMAGENET_STD = (0.229, 0.224, 0.225)
 
 @dataclass(frozen=True)
 class TrainingConfig:
+    """Parameters shared by local and Modal contrastive-training runs."""
     data_dir: str
     output_dir: str
     epochs: int = 20
@@ -39,8 +40,6 @@ class TrainingConfig:
     eval_movies: int = 6
     seed: int = 42
     limit: int | None = None
-    device: str = "auto"
-    lighting_preset: str = "legacy"
 
 
 class RandomJpegCompression:
@@ -52,11 +51,13 @@ class RandomJpegCompression:
         maximum_quality: int = 95,
         probability: float = 0.7,
     ):
+        # Configure a probabilistic JPEG round-trip for one PIL image.
         self.minimum_quality = minimum_quality
         self.maximum_quality = maximum_quality
         self.probability = probability
 
     def __call__(self, image: Image.Image) -> Image.Image:
+        # Return the original image or a randomly quality-compressed copy.
         if random.random() >= self.probability:
             return image
         buffer = io.BytesIO()
@@ -74,10 +75,12 @@ class RandomResolutionDegradation:
     """Simulate an online image that was reduced and then enlarged again."""
 
     def __init__(self, minimum_scale: float = 0.45, probability: float = 0.5):
+        # Configure the probability and smallest temporary resolution.
         self.minimum_scale = minimum_scale
         self.probability = probability
 
     def __call__(self, image: Image.Image) -> Image.Image:
+        # Downsample and upsample an image to simulate a lower-resolution source.
         if random.random() >= self.probability:
             return image
         width, height = image.size
@@ -96,64 +99,15 @@ class RandomResolutionDegradation:
         )
 
 
-class RandomGamma:
-    """Apply a modest nonlinear brightness change seen in online encodes."""
-
-    def __init__(
-        self, minimum: float = 0.8, maximum: float = 1.2, probability: float = 0.35
-    ):
-        self.minimum = minimum
-        self.maximum = maximum
-        self.probability = probability
-
-    def __call__(self, image: Image.Image) -> Image.Image:
-        if random.random() >= self.probability:
-            return image
-        return transforms.functional.adjust_gamma(
-            image, random.uniform(self.minimum, self.maximum)
-        )
-
-
-def training_transform(
-    image_size: int, lighting_preset: str = "legacy"
-) -> transforms.Compose:
-    """Mild transformations that define what Curtain considers the same frame."""
-    if lighting_preset not in ("legacy", "lighting-v1", "crop-v1"):
-        raise ValueError(f"Unknown lighting preset: {lighting_preset}")
-    if lighting_preset == "crop-v1":
-        return transforms.Compose(
-            [RandomFrameCrop(), training_transform(image_size, "lighting-v1")]
-        )
-    if lighting_preset == "lighting-v1":
-        return transforms.Compose(
-            [
-                transforms.Resize((image_size, image_size), antialias=True),
-                RandomLighting(),
-                transforms.RandomApply(
-                    [transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 0.8))], p=0.2
-                ),
-                RandomResolutionDegradation(),
-                RandomJpegCompression(),
-                transforms.ToTensor(),
-                transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
-            ]
-        )
+def appearance_transform(image_size: int) -> transforms.Compose:
+    # Lighting and compression changes that preserve a frame's identity.
     return transforms.Compose(
         [
             transforms.Resize((image_size, image_size), antialias=True),
+            RandomLighting(),
             transforms.RandomApply(
-                [
-                    transforms.ColorJitter(
-                        brightness=0.25, contrast=0.25, saturation=0.15
-                    )
-                ],
-                p=0.8,
+                [transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 0.8))], p=0.2
             ),
-            transforms.RandomApply(
-                [transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 0.8))],
-                p=0.2,
-            ),
-            RandomGamma(),
             RandomResolutionDegradation(),
             RandomJpegCompression(),
             transforms.ToTensor(),
@@ -162,7 +116,13 @@ def training_transform(
     )
 
 
+def training_transform(image_size: int) -> transforms.Compose:
+    # The active crop-v1 positive-pair transformation.
+    return transforms.Compose([RandomFrameCrop(), appearance_transform(image_size)])
+
+
 def reference_transform(image_size: int) -> transforms.Compose:
+    # Build the deterministic preprocessing used for indexed reference frames.
     return transforms.Compose(
         [
             transforms.Resize((image_size, image_size), antialias=True),
@@ -173,6 +133,7 @@ def reference_transform(image_size: int) -> transforms.Compose:
 
 
 def discover_movies(data_dir: Path) -> dict[str, list[Path]]:
+    # Find populated movie directories and their supported image files.
     movies: dict[str, list[Path]] = {}
     for directory in sorted(path for path in data_dir.iterdir() if path.is_dir()):
         frames = sorted(
@@ -192,6 +153,7 @@ def discover_movies(data_dir: Path) -> dict[str, list[Path]]:
 def split_movies(
     movies: dict[str, list[Path]], eval_movies: int, seed: int
 ) -> tuple[list[str], list[str]]:
+    # Split complete movie titles into deterministic train and evaluation sets.
     names = sorted(movies)
     random.Random(seed).shuffle(names)
     if not 1 <= eval_movies < len(names):
@@ -202,6 +164,7 @@ def split_movies(
 def select_paths(
     movies: dict[str, list[Path]], names: list[str], limit: int | None, seed: int
 ) -> list[Path]:
+    # Flatten selected movies and optionally sample a reproducible frame limit.
     paths = [path for name in names for path in movies[name]]
     if limit is not None and limit < len(paths):
         paths = random.Random(seed).sample(paths, limit)
@@ -209,56 +172,44 @@ def select_paths(
 
 
 class PositivePairDataset(Dataset):
-    def __init__(
-        self, paths: list[Path], image_size: int, lighting_preset: str = "legacy"
-    ):
+    def __init__(self, paths: list[Path], image_size: int):
+        # Prepare paired transforms for the same source frame.
         self.paths = paths
-        self.transform = training_transform(image_size, lighting_preset)
-        self.anchor_transform = (
-            training_transform(image_size, "lighting-v1")
-            if lighting_preset == "crop-v1"
-            else self.transform
-        )
+        self.anchor_transform = appearance_transform(image_size)
+        self.positive_transform = training_transform(image_size)
 
     def __len__(self) -> int:
         return len(self.paths)
 
     def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor]:
+        # Load one frame and return its anchor and augmented positive views.
         with Image.open(self.paths[index]) as image:
             source = ImageOps.exif_transpose(image).convert("RGB")
-        return self.anchor_transform(source), self.transform(source)
+        return self.anchor_transform(source), self.positive_transform(source)
 
 
 class RetrievalDataset(Dataset):
     def __init__(self, paths: list[Path], image_size: int):
+        # Prepare deterministic references and appearance-varied query views.
         self.paths = paths
         self.reference = reference_transform(image_size)
-        self.query = training_transform(image_size)
+        self.query = appearance_transform(image_size)
 
     def __len__(self) -> int:
         return len(self.paths)
 
     def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor, int, str]:
+        # Return reference/query tensors plus the source index and movie name.
         path = self.paths[index]
         with Image.open(path) as image:
             source = ImageOps.exif_transpose(image).convert("RGB")
         return self.reference(source), self.query(source), index, path.parent.name
 
 
-class CurtainEncoder(nn.Module):
-    def __init__(self, embedding_dim: int = 128):
-        super().__init__()
-        self.backbone = resnet18(weights=None)
-        self.backbone.fc = nn.Linear(self.backbone.fc.in_features, embedding_dim)
-
-    def forward(self, images: torch.Tensor) -> torch.Tensor:
-        return functional.normalize(self.backbone(images), dim=1)
-
-
 def contrastive_loss(
     first: torch.Tensor, second: torch.Tensor, temperature: float
 ) -> torch.Tensor:
-    """Symmetric in-batch InfoNCE loss for two views of every source frame."""
+    # Compute symmetric in-batch InfoNCE for two views of every source frame.
     batch_size = first.shape[0]
     embeddings = torch.cat((first, second), dim=0)
     logits = embeddings.float() @ embeddings.float().T / temperature
@@ -268,18 +219,11 @@ def contrastive_loss(
     return functional.cross_entropy(logits, targets)
 
 
-def choose_device(requested: str) -> torch.device:
-    if requested == "auto":
-        requested = "cuda" if torch.cuda.is_available() else "cpu"
-    if requested == "cuda" and not torch.cuda.is_available():
-        raise RuntimeError("CUDA was requested but is unavailable.")
-    return torch.device(requested)
-
-
 @torch.inference_mode()
 def evaluate(
     model: nn.Module, loader: DataLoader, device: torch.device
 ) -> dict[str, float]:
+    # Measure exact-frame and movie-level top-1 retrieval on one split.
     model.eval()
     references: list[torch.Tensor] = []
     queries: list[torch.Tensor] = []
@@ -307,6 +251,7 @@ def evaluate(
 
 
 def seed_everything(seed: int) -> None:
+    # Seed Python, Torch, and all visible CUDA devices.
     random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
@@ -314,6 +259,7 @@ def seed_everything(seed: int) -> None:
 
 
 def train(config: TrainingConfig) -> dict[str, float]:
+    # Train the encoder on Modal's CUDA device and save the best checkpoint.
     seed_everything(config.seed)
     data_dir = Path(config.data_dir).expanduser().resolve()
     output_dir = Path(config.output_dir).expanduser().resolve()
@@ -335,16 +281,17 @@ def train(config: TrainingConfig) -> dict[str, float]:
     (output_dir / "split.json").write_text(json.dumps(split_manifest, indent=2) + "\n")
     (output_dir / "config.json").write_text(json.dumps(asdict(config), indent=2) + "\n")
 
-    device = choose_device(config.device)
-    pin_memory = device.type == "cuda"
+    if not torch.cuda.is_available():
+        raise RuntimeError("Curtain training requires CUDA.")
+    device = torch.device("cuda")
     loader_kwargs = {
         "batch_size": config.batch_size,
         "num_workers": config.workers,
-        "pin_memory": pin_memory,
+        "pin_memory": True,
         "persistent_workers": config.workers > 0,
     }
     train_loader = DataLoader(
-        PositivePairDataset(train_paths, config.image_size, config.lighting_preset),
+        PositivePairDataset(train_paths, config.image_size),
         shuffle=True,
         drop_last=True,
         **loader_kwargs,
@@ -356,14 +303,14 @@ def train(config: TrainingConfig) -> dict[str, float]:
         **loader_kwargs,
     )
 
-    model = CurtainEncoder(config.embedding_dim).to(device)
+    model = CurtainEncoder(config.embedding_dim, config.image_size).to(device)
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay
     )
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=config.epochs
     )
-    scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
+    scaler = torch.amp.GradScaler("cuda")
     best_accuracy = -1.0
     final_metrics: dict[str, float] = {}
 
@@ -376,11 +323,7 @@ def train(config: TrainingConfig) -> dict[str, float]:
             optimizer.zero_grad(set_to_none=True)
             first = first.to(device, non_blocking=True)
             second = second.to(device, non_blocking=True)
-            with torch.autocast(
-                device_type=device.type,
-                dtype=torch.float16,
-                enabled=device.type == "cuda",
-            ):
+            with torch.autocast("cuda", dtype=torch.float16):
                 first_embeddings = model(first)
                 second_embeddings = model(second)
                 loss = contrastive_loss(
@@ -402,11 +345,9 @@ def train(config: TrainingConfig) -> dict[str, float]:
 
         checkpoint = {
             "model": model.state_dict(),
-            "optimizer": optimizer.state_dict(),
             "config": asdict(config),
             "metrics": final_metrics,
         }
-        torch.save(checkpoint, output_dir / "latest.pt")
         if final_metrics["exact_frame_top1"] > best_accuracy:
             best_accuracy = final_metrics["exact_frame_top1"]
             torch.save(checkpoint, output_dir / "best.pt")
@@ -416,45 +357,18 @@ def train(config: TrainingConfig) -> dict[str, float]:
 
 
 def parse_args() -> TrainingConfig:
+    # Parse the intentionally small local training command line.
     parser = argparse.ArgumentParser(
         description="Train Curtain's contrastive frame encoder."
     )
     parser.add_argument("--data", type=Path, default=Path("selected_screenshots"))
     parser.add_argument("--output", type=Path, default=Path("training_runs/default"))
     parser.add_argument("--epochs", type=int, default=20)
-    parser.add_argument("--batch-size", type=int, default=64)
-    parser.add_argument("--image-size", type=int, default=192)
-    parser.add_argument("--embedding-dim", type=int, default=128)
-    parser.add_argument("--learning-rate", type=float, default=3e-4)
-    parser.add_argument("--temperature", type=float, default=0.07)
-    parser.add_argument("--weight-decay", type=float, default=1e-4)
-    parser.add_argument("--workers", type=int, default=8)
-    parser.add_argument("--eval-movies", type=int, default=6)
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--limit", type=int)
-    parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
-    parser.add_argument(
-        "--lighting-preset",
-        choices=("legacy", "lighting-v1", "crop-v1"),
-        default="legacy",
-    )
     args = parser.parse_args()
     return TrainingConfig(
         data_dir=str(args.data),
         output_dir=str(args.output),
         epochs=args.epochs,
-        batch_size=args.batch_size,
-        image_size=args.image_size,
-        embedding_dim=args.embedding_dim,
-        learning_rate=args.learning_rate,
-        temperature=args.temperature,
-        weight_decay=args.weight_decay,
-        workers=args.workers,
-        eval_movies=args.eval_movies,
-        seed=args.seed,
-        limit=args.limit,
-        device=args.device,
-        lighting_preset=args.lighting_preset,
     )
 
 

@@ -12,10 +12,12 @@ EXPLANATION = ('Training: some frames were used to learn the model. Validation: 
 
 
 def movie_key(name):
+    # Return the case-insensitive key used when comparing movie names.
     return name.casefold()
 
 
 def load_split(checkpoint, checkpoint_hash, project_root):
+    # Load provenance only when a split belongs to the active checkpoint.
     for folder in (checkpoint.parent, project_root / 'trained_models/l4-50k'):
         split, best = folder / 'split.json', folder / 'best.pt'
         if split.exists() and best.exists() and hashlib.sha256(best.read_bytes()).hexdigest() == checkpoint_hash:
@@ -24,6 +26,7 @@ def load_split(checkpoint, checkpoint_hash, project_root):
 
 
 def category(name, split):
+    # Classify a movie as training, validation, unseen, or unknown.
     if split is None:
         return 'unknown'
     key = movie_key(name)

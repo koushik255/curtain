@@ -12,12 +12,14 @@ class RandomFrameCrop:
     """Randomly change framing while retaining most of the source image."""
 
     def __init__(self, probability=0.7, minimum_fraction=0.75):
+        # Configure how often and how tightly the frame is cropped.
         if not 0 <= probability <= 1 or not 0 < minimum_fraction <= 1:
             raise ValueError("Invalid crop probability or minimum fraction")
         self.probability = probability
         self.minimum_fraction = minimum_fraction
 
     def box(self, size):
+        # Choose a valid crop rectangle, or the full image for identity.
         width, height = size
         if float(torch.rand(())) >= self.probability:
             return (0, 0, width, height)
@@ -30,11 +32,13 @@ class RandomFrameCrop:
         return (left, top, left + crop_width, top + crop_height)
 
     def __call__(self, image):
+        # Return the image with the sampled framing change applied.
         return image.crop(self.box(image.size))
 
 
 @dataclass(frozen=True)
 class LightingConfig:
+    """Probability and range settings for RandomLighting."""
     clean_probability: float = 0.2
     mild_probability: float = 0.5
     brightness: tuple[float, float] = (0.6, 1.4)
@@ -44,6 +48,7 @@ class LightingConfig:
     temperature_strength: float = 0.08
 
     def __post_init__(self):
+        # Validate probability and appearance ranges after construction.
         probabilities_are_valid = (
             0 <= self.clean_probability <= 1
             and 0 <= self.mild_probability <= 1
@@ -63,13 +68,16 @@ class RandomLighting:
     """Apply clean, mild, or broad appearance variation using the Torch RNG."""
 
     def __init__(self, config: LightingConfig | None = None):
+        # Use the supplied lighting recipe, or the project's default recipe.
         self.config = config or LightingConfig()
 
     @staticmethod
     def sample(bounds):
+        # Sample a scalar with Torch's RNG so worker seeding stays reproducible.
         return float(torch.empty(()).uniform_(*bounds))
 
     def __call__(self, image: Image.Image) -> Image.Image:
+        # Return a clean, mildly altered, or broadly altered RGB image.
         if image.mode != "RGB":
             raise ValueError("Lighting augmentation expects an RGB image")
         config = self.config
