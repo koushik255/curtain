@@ -1,7 +1,7 @@
 [project]
 name = "curtain-search"
 version = "0.1.0"
-description = "Local SSCD reverse search for movie screenshots"
+description = "Exact-frame movie search with SSCD and a contrastively trained encoder"
 requires-python = ">=3.12"
 dependencies = [
     "flask>=3.1,<4",

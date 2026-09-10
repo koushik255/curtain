@@ -1,5 +1,29 @@
 # curtain
 
+Curtain combines a Rust movie-frame extractor with Python image-search models.
+The original SSCD pipeline lives in `src/`; the contrastively trained model is
+implemented in `curtain_ml/`. Remote GPU jobs, benchmarks, applications, and
+tests are kept in `cloud/`, `benchmarks/`, `apps/`, and `tests/` respectively.
+See `docs/training.md` for the trained-model workflow.
+
+## Project layout
+
+```text
+apps/         Runnable web applications and their templates
+benchmarks/   Repeatable accuracy and robustness evaluations
+cloud/        Modal training, indexing, and benchmark jobs
+curtain_ml/   Reusable model, augmentation, training, and retrieval code
+docs/         Longer workflow documentation
+experiments/  One-off investigations kept outside the production package
+scripts/      Small local command-line utilities
+src/          Rust extractor and the original SSCD implementation
+tests/        Fast automated tests
+```
+
+Large local datasets and generated artifacts remain in the ignored
+`screenshots/`, `selected_screenshots*`, `trained_models/`, and
+`trained_indexes/` directories so the running services keep stable paths.
+
 A Rust command-line program that uses FFmpeg to save one JPEG screenshot every 0.5 seconds (2 frames per second) from movies. Screenshots are scaled down to a maximum width of 1280 pixels without enlarging smaller videos, and use moderate JPEG quality for faster processing and smaller files.
 
 ## Requirements
