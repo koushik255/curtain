@@ -11,9 +11,12 @@ set(CMAKE_HIP_STANDARD 20)
 
 find_package(hip REQUIRED)
 find_package(migraphx REQUIRED)
-find_package(rocjpeg REQUIRED)
+# CPU JPEG decode (libturbojpeg0-dev).
+find_library(TURBOJPEG_LIBRARY turbojpeg REQUIRED)
+find_path(TURBOJPEG_INCLUDE turbojpeg.h REQUIRED)
 
 add_executable(rcmindex src/main.cpp src/kernels.hip)
 set_source_files_properties(src/main.cpp PROPERTIES LANGUAGE HIP)
 target_compile_options(rcmindex PRIVATE -O3 -Wall -Wextra)
-target_link_libraries(rcmindex PRIVATE hip::host migraphx::c rocjpeg::rocjpeg)
+target_include_directories(rcmindex PRIVATE ${TURBOJPEG_INCLUDE})
+target_link_libraries(rcmindex PRIVATE hip::host migraphx::c ${TURBOJPEG_LIBRARY})

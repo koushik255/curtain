@@ -38,11 +38,11 @@ __global__ void horizontal(const FrameView* frames, int max_height, int size, fl
     const int c = fc % 3;
     if (x >= size || y >= int(f.height)) return;
     const Taps t = taps_for(x, f.width, size);
-    const std::uint8_t* row = f.plane[c] + std::size_t(y) * f.pitch[c] + t.first;
+    const std::uint8_t* row = f.plane[c] + std::size_t(y) * f.pitch[c] + std::size_t(t.first) * f.step;
     float sum = 0.0f, total = 0.0f;
     for (int j = 0; j < t.count; ++j) {
         const float w = tap_weight(t, j);
-        sum += w * row[j];
+        sum += w * row[std::size_t(j) * f.step];
         total += w;
     }
     scratch[(std::size_t(fc) * max_height + y) * size + x] = sum / total;

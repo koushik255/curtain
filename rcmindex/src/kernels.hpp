@@ -6,10 +6,12 @@
 
 namespace rcm {
 
-// One decoded RGB-planar frame in device memory.
+// One decoded RGB frame in device memory: channel c of pixel (x, y) is at
+// plane[c][y * pitch[c] + x * step] (step 3 for interleaved, 1 for planar).
 struct FrameView {
     const std::uint8_t* plane[3];
     std::uint32_t pitch[3];
+    std::uint32_t step;
     std::uint32_t width;
     std::uint32_t height;
 };
