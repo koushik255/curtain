@@ -21,10 +21,11 @@ from curtain_ml.provenance import LABELS, EXPLANATION, category, load_split, mov
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_CHECKPOINT = PROJECT_ROOT / "trained_models/l4-50k-crop-v1-20260909/best.pt"
-DEFAULT_INDEX = PROJECT_ROOT / "trained_indexes/l4-50k-crop-v1"
-DEFAULT_EXTRA_INDEX = PROJECT_ROOT / "trained_indexes/l4-50k-lbfive-crop-v1"
-DEFAULT_FRAMES = PROJECT_ROOT / "screenshots"
+LOCAL_ROOT = PROJECT_ROOT / ".local"
+DEFAULT_CHECKPOINT = LOCAL_ROOT / "trained_models/l4-50k-crop-v1-20260909/best.pt"
+DEFAULT_INDEX = LOCAL_ROOT / "trained_indexes/l4-50k-crop-v1"
+DEFAULT_EXTRA_INDEX = LOCAL_ROOT / "trained_indexes/l4-50k-lbfive-crop-v1"
+DEFAULT_FRAMES = LOCAL_ROOT / "screenshots"
 
 
 class TrainedSearchEngine:
@@ -199,7 +200,7 @@ engine: TrainedSearchEngine
 
 @app.after_request
 def security_headers(response):
-    # Add conservative headers to every response from the private site.
+    # Add conservative headers to every response from the site.
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["Referrer-Policy"] = "no-referrer"
     response.headers["Cache-Control"] = "no-store"
@@ -309,7 +310,10 @@ def gallery():
     for movie in movie_list:
         count = min(16 if selected else 2, movie["frames"])
         for position in np.linspace(0, movie['frames'] - 1, count + 2, dtype=int)[1:-1]:
-            for start, length in movie.get('spans', [(movie['start'], movie['frames'])]):
+            spans = movie.get('spans')
+            if spans is None:
+                spans = [(movie['start'], movie['frames'])]
+            for start, length in spans:
                 if position < length:
                     indices.append(start + position)
                     break

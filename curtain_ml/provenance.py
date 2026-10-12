@@ -18,7 +18,7 @@ def movie_key(name):
 
 def load_split(checkpoint, checkpoint_hash, project_root):
     # Load provenance only when a split belongs to the active checkpoint.
-    for folder in (checkpoint.parent, project_root / 'trained_models/l4-50k'):
+    for folder in (checkpoint.parent, project_root / '.local/trained_models/l4-50k'):
         split, best = folder / 'split.json', folder / 'best.pt'
         if split.exists() and best.exists() and hashlib.sha256(best.read_bytes()).hexdigest() == checkpoint_hash:
             return json.loads(split.read_text())

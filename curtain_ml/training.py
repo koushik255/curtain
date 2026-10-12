@@ -15,7 +15,7 @@ from PIL import Image, ImageOps
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
-from curtain_ml.augmentations import RandomFrameCrop, RandomLighting
+from curtain_ml.augmentations import GridTilePairCrop, RandomFrameCrop, RandomLighting
 from curtain_ml.model import CurtainEncoder
 
 
@@ -40,6 +40,9 @@ class TrainingConfig:
     eval_movies: int = 6
     seed: int = 42
     limit: int | None = None
+    view_mode: str = "frame_crop"
+    grid_size: int = 4
+    tile_jitter: float = 0.5
 
 
 class RandomJpegCompression:
@@ -188,6 +191,30 @@ class PositivePairDataset(Dataset):
         return self.anchor_transform(source), self.positive_transform(source)
 
 
+class GridPositivePairDataset(Dataset):
+    """Return an exact grid tile and a nearby tile-sized crop of one frame."""
+
+    def __init__(
+        self,
+        paths: list[Path],
+        image_size: int,
+        grid_size: int = 4,
+        tile_jitter: float = 0.5,
+    ):
+        self.paths = paths
+        self.pair_crop = GridTilePairCrop(grid_size, tile_jitter)
+        self.appearance = appearance_transform(image_size)
+
+    def __len__(self) -> int:
+        return len(self.paths)
+
+    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor]:
+        with Image.open(self.paths[index]) as image:
+            source = ImageOps.exif_transpose(image).convert("RGB")
+        reference, shifted = self.pair_crop(source)
+        return self.appearance(reference), self.appearance(shifted)
+
+
 class RetrievalDataset(Dataset):
     def __init__(self, paths: list[Path], image_size: int):
         # Prepare deterministic references and appearance-varied query views.
@@ -204,6 +231,46 @@ class RetrievalDataset(Dataset):
         with Image.open(path) as image:
             source = ImageOps.exif_transpose(image).convert("RGB")
         return self.reference(source), self.query(source), index, path.parent.name
+
+
+class GridRetrievalDataset(Dataset):
+    """Deterministically evaluate exact grid tiles against shifted local crops."""
+
+    def __init__(
+        self,
+        paths: list[Path],
+        image_size: int,
+        seed: int,
+        grid_size: int = 4,
+        tile_jitter: float = 0.5,
+    ):
+        self.paths = paths
+        self.seed = seed
+        self.pair_crop = GridTilePairCrop(grid_size, tile_jitter)
+        self.reference = reference_transform(image_size)
+        self.query = appearance_transform(image_size)
+
+    def __len__(self) -> int:
+        return len(self.paths)
+
+    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor, int, str]:
+        path = self.paths[index]
+        with Image.open(path) as image:
+            source = ImageOps.exif_transpose(image).convert("RGB")
+        generator = torch.Generator().manual_seed(self.seed + index)
+        reference, shifted = self.pair_crop(source, generator)
+
+        # Keep validation appearance changes fixed across epochs and workers.
+        python_state = random.getstate()
+        torch_state = torch.random.get_rng_state()
+        random.seed(self.seed + index)
+        torch.manual_seed(self.seed + index)
+        try:
+            query = self.query(shifted)
+        finally:
+            random.setstate(python_state)
+            torch.random.set_rng_state(torch_state)
+        return self.reference(reference), query, index, path.parent.name
 
 
 def contrastive_loss(
@@ -290,14 +357,34 @@ def train(config: TrainingConfig) -> dict[str, float]:
         "pin_memory": True,
         "persistent_workers": config.workers > 0,
     }
+    if config.view_mode == "frame_crop":
+        train_dataset = PositivePairDataset(train_paths, config.image_size)
+        eval_dataset = RetrievalDataset(eval_paths, config.image_size)
+    elif config.view_mode == "grid_tile":
+        train_dataset = GridPositivePairDataset(
+            train_paths,
+            config.image_size,
+            config.grid_size,
+            config.tile_jitter,
+        )
+        eval_dataset = GridRetrievalDataset(
+            eval_paths,
+            config.image_size,
+            config.seed + 100_000,
+            config.grid_size,
+            config.tile_jitter,
+        )
+    else:
+        raise ValueError(f"Unknown training view mode: {config.view_mode}")
+
     train_loader = DataLoader(
-        PositivePairDataset(train_paths, config.image_size),
+        train_dataset,
         shuffle=True,
         drop_last=True,
         **loader_kwargs,
     )
     eval_loader = DataLoader(
-        RetrievalDataset(eval_paths, config.image_size),
+        eval_dataset,
         shuffle=False,
         drop_last=False,
         **loader_kwargs,
@@ -361,7 +448,7 @@ def parse_args() -> TrainingConfig:
     parser = argparse.ArgumentParser(
         description="Train Curtain's contrastive frame encoder."
     )
-    parser.add_argument("--data", type=Path, default=Path("selected_screenshots"))
+    parser.add_argument("--data", type=Path, default=Path(".local/selected_screenshots"))
     parser.add_argument("--output", type=Path, default=Path("training_runs/default"))
     parser.add_argument("--epochs", type=int, default=20)
     args = parser.parse_args()

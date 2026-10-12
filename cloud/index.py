@@ -13,6 +13,7 @@ import modal
 
 
 ROOT = Path(__file__).resolve().parents[1]
+LOCAL_ROOT = ROOT / ".local"
 VOLUME_NAME = "curtain-training-data"
 RUN = "l4-50k-crop-v1-20260909"
 CHECKPOINT_HASH = "a35b1528a734e451f1165418acf4ca24b5a5cc27d5c6be7dab461663c640ab3d"
@@ -121,7 +122,7 @@ def tasks() -> list[dict]:
     # Build one independent indexing task for every source movie.
     result = []
     for source_collection, archive_dir, output_collection in COLLECTIONS:
-        source = ROOT / "trained_indexes" / source_collection
+        source = LOCAL_ROOT / "trained_indexes" / source_collection
         collection = json.loads((source / "collection.json").read_text())
         for movie in collection["movies"]:
             manifest = json.loads((source / movie["movie"] / "manifest.json").read_text())
@@ -155,12 +156,12 @@ def download_and_verify(all_tasks: list[dict]) -> None:
                 "--force",
                 VOLUME_NAME,
                 f"/indexes/{output_collection}",
-                str(ROOT / "trained_indexes"),
+                str(LOCAL_ROOT / "trained_indexes"),
             ],
             check=True,
         )
-        destination = ROOT / "trained_indexes" / output_collection
-        source = ROOT / "trained_indexes" / source_collection
+        destination = LOCAL_ROOT / "trained_indexes" / output_collection
+        source = LOCAL_ROOT / "trained_indexes" / source_collection
         source_manifest = json.loads((source / "collection.json").read_text())
         manifests = []
         for movie in source_manifest["movies"]:

@@ -36,6 +36,59 @@ class RandomFrameCrop:
         return image.crop(self.box(image.size))
 
 
+class GridTilePairCrop:
+    """Crop an exact grid tile and a jittered, overlapping tile-sized view."""
+
+    def __init__(self, grid_size: int = 4, jitter_fraction: float = 0.5):
+        if grid_size < 2:
+            raise ValueError("Grid size must be at least two")
+        if not 0 <= jitter_fraction <= 1:
+            raise ValueError("Jitter fraction must be between zero and one")
+        self.grid_size = grid_size
+        self.jitter_fraction = jitter_fraction
+
+    def boxes(self, size, generator: torch.Generator | None = None):
+        """Sample an exact grid cell and a nearby box with identical dimensions."""
+        width, height = size
+        tile_width = width // self.grid_size
+        tile_height = height // self.grid_size
+        if tile_width < 1 or tile_height < 1:
+            raise ValueError("Image is smaller than the requested grid")
+        tile = int(
+            torch.randint(
+                self.grid_size * self.grid_size, (1,), generator=generator
+            ).item()
+        )
+        row, column = divmod(tile, self.grid_size)
+        left = column * tile_width
+        top = row * tile_height
+        maximum_x = round(tile_width * self.jitter_fraction)
+        maximum_y = round(tile_height * self.jitter_fraction)
+        delta_x = int(
+            torch.randint(-maximum_x, maximum_x + 1, (1,), generator=generator).item()
+        )
+        delta_y = int(
+            torch.randint(-maximum_y, maximum_y + 1, (1,), generator=generator).item()
+        )
+        shifted_left = min(max(0, left + delta_x), width - tile_width)
+        shifted_top = min(max(0, top + delta_y), height - tile_height)
+        return (
+            (left, top, left + tile_width, top + tile_height),
+            (
+                shifted_left,
+                shifted_top,
+                shifted_left + tile_width,
+                shifted_top + tile_height,
+            ),
+        )
+
+    def __call__(
+        self, image: Image.Image, generator: torch.Generator | None = None
+    ) -> tuple[Image.Image, Image.Image]:
+        reference, shifted = self.boxes(image.size, generator)
+        return image.crop(reference), image.crop(shifted)
+
+
 @dataclass(frozen=True)
 class LightingConfig:
     """Probability and range settings for RandomLighting."""

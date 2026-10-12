@@ -1,5 +1,5 @@
 [Unit]
-Description=Curtain trained-model private screenshot search
+Description=Curtain trained-model screenshot search
 After=network-online.target
 
 [Service]

@@ -63,9 +63,9 @@ Run all movies and download both verified collections:
 The active local outputs are:
 
 ```text
-trained_models/l4-50k-crop-v1-20260909/best.pt
-trained_indexes/l4-50k-crop-v1/
-trained_indexes/l4-50k-lbfive-crop-v1/
+.local/trained_models/l4-50k-crop-v1-20260909/best.pt
+.local/trained_indexes/l4-50k-crop-v1/
+.local/trained_indexes/l4-50k-lbfive-crop-v1/
 ```
 
 Every collection and movie manifest stores the checkpoint hash, source hash,

@@ -1,13 +1,12 @@
 # Curtain
 
-Curtain finds the closest indexed movie frame to a supplied image. It has four
-parts:
+Curtain finds the closest indexed movie frame to a supplied image. The active
+code is small:
 
 ```text
-src/main.rs          Extract movie frames with FFmpeg
-curtain_ml/          Train the encoder and build indexes
-cloud/               Run training and indexing on Modal L4 GPUs
-apps/                Serve the private search site
+curtain_ml/          Encoder and retrieval logic
+cloud/               Training and indexing jobs
+apps/                Search site
 ```
 
 The encoder is a ResNet-18 trained from scratch with contrastive learning. Two
@@ -16,32 +15,26 @@ batch are negatives. The current augmentation recipe changes crop, lighting,
 resolution, blur, and JPEG quality. The resulting 128-value embeddings are
 L2-normalized, so search is a matrix-vector dot product (cosine similarity).
 
-Large inputs and outputs are intentionally ignored by Git: `screenshots/`,
-`selected_screenshots*`, `trained_models/`, and `trained_indexes/`.
+Large inputs and local-only material live in the ignored `.local/` directory:
 
-## Extract frames
-
-The Rust extractor samples every movie at 2 fps, scales frames to at most 1280
-pixels wide, and writes JPEGs to `screenshots/<movie>/`:
-
-```sh
-cargo run --release -- --check /path/to/movies /home/koushik/curtain/screenshots
+```text
+.local/
+  screenshots/             Source frames
+  selected_screenshots*/   Training selections
+  trained_models/          Checkpoints and experiment reports
+  trained_indexes/         Frame embeddings
+  transfer/                Transfer archive
+  output/                  Generated assets
+  web/                     Local website copy
+  archive/                 Retired Rust, video, scripts, tests, and probes
 ```
 
-It scans the given directory and its immediate subdirectories. Two movies run
-in parallel by default; set `CURTAIN_JOBS` to change that. Existing frame
-sequences are resumed.
+The standard Python environment remains at `.venv/` so `uv` and the installed
+service continue to work; Git ignores it too.
 
 ## Train and index
 
-Install the Python environment and run tests:
-
-```sh
-uv sync
-uv run python -m unittest discover -s tests
-```
-
-Training and indexing intentionally require CUDA. They run on Modal L4s:
+Training and indexing run on GPU hosts:
 
 ```sh
 .venv/bin/modal run cloud/train.py --epochs 20 --run-name my-run
@@ -53,12 +46,15 @@ See [docs/training.md](docs/training.md) for the data and artifact flow.
 
 ## Search site
 
-The local server loads the crop-v1 checkpoint and both verified index
-collections:
+The local server loads its checkpoint, indexes, and frames from `.local/`:
 
 ```sh
 uv run python -m apps.server --host 127.0.0.1 --port 8781
 ```
 
-Tailscale Serve exposes it privately on the tailnet at port 8444. The retired
-8443 service is not part of this repository.
+Cloudflare Tunnel exposes it publicly at
+`https://curtain.koushikkoushik.com`. The origin remains bound to
+`127.0.0.1:8781`; only the local tunnel connector can reach it.
+
+The Rust extractor, NVIDIA video pipeline, old tests, and one-off probes are
+preserved in `.local/archive/` but are no longer part of the Git-facing project.

@@ -1,4 +1,5 @@
 # Source images and manually selected training/evaluation data
+/.local/
 /screenshots/
 /selected_screenshots*/
 /testing/
@@ -8,6 +9,8 @@
 /index-*/
 /trained_indexes/
 /trained_models/
+/output/
+/.transfer/
 /training_runs/
 /runs/
 /models/
@@ -55,3 +58,4 @@ Thumbs.db
 # Codex-local metadata
 /.agents/
 /.codex/
+rcmindex/build/
