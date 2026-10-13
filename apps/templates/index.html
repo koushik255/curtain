@@ -128,19 +128,54 @@
         trackerProgress.max = data.frames;
       }).catch(() => { status.textContent = "The trained index is unavailable."; });
 
+      // The model sees every query at 192x192 (pieces included), so a 640 px
+      // JPEG carries all it needs. Shrinking happens when the image is chosen,
+      // before "Find the frame", so only the upload and search are timed.
+      const UPLOAD_SIDE = 640;
+      let preparedUpload = null;
+
+      async function prepareUpload(file) {
+        try {
+          const bitmap = await createImageBitmap(file, { imageOrientation: "from-image" });
+          const scale = Math.min(1, UPLOAD_SIDE / Math.max(bitmap.width, bitmap.height));
+          const canvas = document.createElement("canvas");
+          canvas.width = Math.round(bitmap.width * scale);
+          canvas.height = Math.round(bitmap.height * scale);
+          canvas.getContext("2d").drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+          bitmap.close();
+          const blob = await new Promise(resolve => canvas.toBlob(resolve, "image/jpeg", 0.9));
+          return blob && blob.size < file.size ? blob : file;
+        } catch {
+          return file;  // send the original if the browser cannot decode it here
+        }
+      }
+
+      function kilobytes(bytes) {
+        return bytes >= 1e6 ? `${(bytes / 1e6).toFixed(1)} MB` : `${Math.max(1, Math.round(bytes / 1e3))} KB`;
+      }
+
       function selectImage(file) {
         if (!file || !file.type.startsWith("image/")) {
           status.textContent = "Please choose a PNG, JPEG, or WebP image.";
           return;
         }
         selectedFile = file;
+        const name = file.name || "Pasted image";
+        status.textContent = `Preparing ${name}…`;
+        preparedUpload = prepareUpload(file).then(blob => {
+          if (selectedFile === file) {
+            status.textContent = blob === file
+              ? `${name} is ready.`
+              : `${name} is ready (${kilobytes(file.size)} → ${kilobytes(blob.size)} to upload).`;
+          }
+          return blob;
+        });
         if (previewUrl) URL.revokeObjectURL(previewUrl);
         previewUrl = URL.createObjectURL(file);
         preview.src = previewUrl;
         preview.hidden = false;
         copy.hidden = true;
         resultsArea.hidden = true;
-        status.textContent = `${file.name || "Pasted image"} is ready.`;
       }
 
       input.addEventListener("change", () => selectImage(input.files[0]));
@@ -170,6 +205,7 @@
         }
         button.disabled = true;
         button.textContent = "Searching…";
+        const upload = await preparedUpload;  // normally finished long before the click
         status.textContent = "Sending the query image…";
         timings.textContent = "";
         resultsArea.hidden = true;
@@ -184,8 +220,8 @@
         try {
           const response = await fetch("/api/search-stream", {
             method: "POST",
-            headers: { "Content-Type": selectedFile.type || "application/octet-stream" },
-            body: selectedFile,
+            headers: { "Content-Type": upload.type || "application/octet-stream" },
+            body: upload,
           });
           if (!response.ok || !response.body) throw new Error("Search failed.");
           const reader = response.body.getReader();
@@ -246,13 +282,16 @@
         results.replaceChildren();
         matches.forEach((match, rank) => {
           const card = document.createElement("figure");
+          const link = document.createElement("a");
+          link.href = match.full_image;
           const image = document.createElement("img");
-          image.src = match.image;
+          image.src = rank === 0 ? match.image : match.thumbnail;
           image.alt = `Match ${rank + 1}: indexed frame from ${match.title}`;
           image.width = rank === 0 ? 640 : 320;
           const caption = document.createElement("figcaption");
           caption.textContent = `${rank + 1}. ${match.title} (${match.year}) · ${match.training_label} · ${clock(match.timestamp_seconds)} · frame ${match.frame_number} · similarity ${match.score.toFixed(3)}`;
-          card.append(image, caption);
+          link.append(image);
+          card.append(link, caption);
           results.append(card);
         });
         resultsArea.hidden = false;

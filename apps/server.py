@@ -6,6 +6,7 @@ import html
 import io
 import json
 import time
+from functools import lru_cache
 from pathlib import Path
 from collections.abc import Iterator
 
@@ -115,7 +116,9 @@ class TrainedSearchEngine:
         movie = self.movie_lookup[record["movie"]]
         record.update(index=index, score=score, title=movie["title"], year=movie["year"],
                       training_status=movie['training_status'], training_label=movie['training_label'],
-                      image=url_for("frame_image", index=index))
+                      image=url_for("frame_image", index=index, w=640),
+                      thumbnail=url_for("frame_image", index=index, w=320),
+                      full_image=url_for("frame_image", index=index))
         return record
 
     def search_stream(self, data: bytes) -> Iterator[dict]:
@@ -263,13 +266,34 @@ def search_stream():
     return Response(generate(), mimetype="application/x-ndjson")
 
 
+THUMBNAIL_WIDTHS = {320, 640}
+
+
+@lru_cache(maxsize=512)
+def thumbnail(path: Path, width: int) -> bytes:
+    # Downscaled JPEG of a frame for result cards; recent ones stay in memory.
+    with Image.open(path) as image:
+        image = image.convert("RGB")
+        if image.width > width:
+            image = image.resize((width, round(image.height * width / image.width)), Image.LANCZOS)
+        buffer = io.BytesIO()
+        image.save(buffer, format="JPEG", quality=85)
+    return buffer.getvalue()
+
+
 @app.get("/frame/<int:index>")
 def frame_image(index: int):
-    # Serve one validated source frame by its internal index row.
+    # Serve one validated source frame by its internal index row; ?w=320|640
+    # returns a smaller copy.
     path = engine.frame_path(index)
     if path is None:
         return jsonify(error="Frame not found."), 404
-    return send_file(path, conditional=True, max_age=0)
+    width = request.args.get("w", type=int)
+    if width is None:
+        return send_file(path, conditional=True, max_age=0)
+    if width not in THUMBNAIL_WIDTHS:
+        return jsonify(error="Unsupported width."), 400
+    return Response(thumbnail(path, width), mimetype="image/jpeg")
 
 
 @app.get("/gallery")

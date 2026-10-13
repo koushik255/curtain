@@ -3,8 +3,9 @@
 A query is one image embedding or several (the crop plus its pieces). Each
 is searched in the IVF-PQ index; the union of candidate frames is re-scored
 exactly from the memory-mapped rcmindex arrays (best of the frame's 49 tiles
-and whole-frame vector, per query image), and a frame's score is the mean over
-the query images.
+and whole-frame vector, per query image). A frame's score is the better of
+the mean over all query images (crops match piece by piece) and the whole
+query's score minus WHOLE_HANDICAP (uncropped screenshots match as a whole).
 """
 
 from __future__ import annotations
@@ -18,6 +19,9 @@ from PIL import Image
 
 FAISS_DIR = Path(__file__).resolve().parents[1] / ".local/faiss"
 INDEX_NAME = "tiles4-global-ivf16384-pq32.faiss"
+# On the 400-query benchmark, mean-only scoring found 52.5% of full frames and
+# whole-only 13.2% of crops; max(whole - 0.1, mean) keeps 93.5% and 48.0%.
+WHOLE_HANDICAP = 0.1
 
 
 def pieces(image: Image.Image) -> list[Image.Image]:
@@ -57,8 +61,8 @@ def frame_vectors(engine: dict, frames: np.ndarray) -> np.ndarray:
 
 
 def search(engine: dict, queries: np.ndarray, candidates: int = 256, top: int = 5) -> list[tuple[int, float]]:
-    """queries: [q, 128] unit vectors for one search (crop + pieces).
-    Returns [(frame id, score)] best first."""
+    """queries: [q, 128] unit vectors for one search, the whole query image
+    first, then its pieces. Returns [(frame id, score)] best first."""
     queries = np.ascontiguousarray(queries, dtype=np.float32)
     _, ids = engine["index"].search(queries, candidates)
     frames = np.unique(ids[ids >= 0] // engine["stride"])
@@ -66,6 +70,6 @@ def search(engine: dict, queries: np.ndarray, candidates: int = 256, top: int = 
         return []
     vectors = frame_vectors(engine, frames)                  # [f, 50, 128]
     best = (vectors @ queries.T).max(axis=1)                 # [f, q] best view per query image
-    score = best.mean(axis=1)
+    score = np.maximum(best[:, 0] - WHOLE_HANDICAP, best.mean(axis=1))
     order = np.argsort(-score)[:top]
     return [(int(frames[i]), float(score[i])) for i in order]
