@@ -14,8 +14,17 @@
       #movies-list { max-height: 55vh; overflow-y: auto; margin: 0; padding-left: 22px; }
       #movies-list li { margin-bottom: 8px; }
       /* Match stage: the upload glides onto its spot in the matched frame. */
-      .stage { position: relative; display: inline-block; max-width: 100%; overflow: hidden; background: #000; line-height: 0; }
-      .stage .frame { display: block; width: 640px; max-width: 100%; height: auto; }
+      /* Results on the left, the match stage on the right (stacked on narrow screens). */
+      .match-layout { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 640px); gap: 24px; align-items: start; }
+      .match-list { order: 1; }
+      .match-view { order: 2; position: sticky; top: 12px; }
+      @media (max-width: 900px) {
+        .match-layout { grid-template-columns: minmax(0, 1fr); }
+        .match-view { order: 1; position: static; }
+        .match-list { order: 2; }
+      }
+      .stage { position: relative; display: block; width: 100%; overflow: hidden; background: #000; line-height: 0; }
+      .stage .frame { display: block; width: 100%; height: auto; }
       .stage svg { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
       .stage .piece { position: absolute; left: 0; top: 0; transform-origin: 0 0; max-width: none;
         box-shadow: 0 8px 30px #0008; will-change: transform, opacity; }
@@ -23,7 +32,7 @@
       .stage-controls { display: flex; flex-wrap: wrap; gap: 8px 24px; align-items: center; margin: 8px 0 16px; }
       .stage-controls label { display: inline-flex; gap: 8px; align-items: center; }
       #results { display: flex; flex-wrap: wrap; gap: 12px; }
-      #results figure { margin: 0; width: 220px; cursor: pointer; }
+      #results figure { margin: 0; width: 200px; cursor: pointer; }
       #results figure[aria-current="true"] img { outline: 3px solid #2fbf71; }
       #results figcaption { font-size: 14px; }
     </style>
@@ -69,22 +78,28 @@
       <section id="results-area" hidden>
         <h2>Closest matches</h2>
         <p id="weak-note" hidden><strong>Low confidence:</strong> the top match could not be confirmed by feature matching and its similarity is under 0.70, so it may be from a different movie.</p>
-        <div class="stage" id="stage">
-          <img class="frame" id="stage-frame" alt="Matched frame" />
-          <img class="piece" id="stage-piece" alt="Your screenshot, placed where it matches" hidden />
-          <svg id="stage-overlay" preserveAspectRatio="none" aria-hidden="true">
-            <path id="stage-dim" fill="#000" fill-rule="evenodd"></path>
-            <polygon id="stage-outline" class="outline"></polygon>
-          </svg>
+        <div class="match-layout">
+          <div class="match-list">
+            <p>All matches, best first. Click one to see where your screenshot sits. Similarity is cosine similarity, not probability.</p>
+            <div id="results" aria-live="polite"></div>
+          </div>
+          <div class="match-view">
+            <div class="stage" id="stage">
+              <img class="frame" id="stage-frame" alt="Matched frame" />
+              <img class="piece" id="stage-piece" alt="Your screenshot, placed where it matches" hidden />
+              <svg id="stage-overlay" preserveAspectRatio="none" aria-hidden="true">
+                <path id="stage-dim" fill="#000" fill-rule="evenodd"></path>
+                <polygon id="stage-outline" class="outline"></polygon>
+              </svg>
+            </div>
+            <p id="stage-caption"></p>
+            <div class="stage-controls">
+              <label>Screenshot opacity <input id="piece-opacity" type="range" min="0" max="100" value="35" /> <span id="piece-value">35%</span></label>
+              <label>Dim the rest <input id="dim-opacity" type="range" min="0" max="85" value="45" /> <span id="dim-value">45%</span></label>
+              <button id="replay" type="button">Replay</button>
+            </div>
+          </div>
         </div>
-        <div class="stage-controls">
-          <label>Screenshot opacity <input id="piece-opacity" type="range" min="0" max="100" value="35" /> <span id="piece-value">35%</span></label>
-          <label>Dim the rest <input id="dim-opacity" type="range" min="0" max="85" value="45" /> <span id="dim-value">45%</span></label>
-          <button id="replay" type="button">Replay</button>
-        </div>
-        <p id="stage-caption"></p>
-        <p>All matches, best first (click one to see where your screenshot sits). Similarity is cosine similarity, not probability.</p>
-        <div id="results" aria-live="polite"></div>
       </section>
     </main>
 
@@ -330,14 +345,14 @@
         stageDim.style.opacity = dimSlider.value / 100;
       }
 
-      function playStage() {
-        animations.forEach(a => a.cancel());
-        settled = false;
+      // Size the overlay for the current layout and put everything in its final
+      // place; returns the animation endpoints, or null if there is no box.
+      function placeStage() {
         const match = shown;
         const located = match && match.matrix && stageFrame.naturalWidth && stagePiece.naturalWidth;
         stagePiece.hidden = !located;
         stageOverlay.style.display = located ? "" : "none";
-        if (!located) return;
+        if (!located) return null;
         const fw = match.frame_width, fh = match.frame_height;
         const qw = stagePiece.naturalWidth, qh = stagePiece.naturalHeight;
         const k = stageFrame.clientWidth / fw;
@@ -351,22 +366,29 @@
         stagePiece.style.width = `${qw}px`;
         const end = cssMatrix(match.matrix, k);
         stagePiece.style.transform = end;
-        if (reducedMotion) { stageOutline.style.strokeDashoffset = 0; settleStage(); return; }
         const s = Math.min(0.6 * fw / qw, 0.8 * fh / qh);
         const start = cssMatrix([s, 0, 0, s, (fw - qw * s) / 2, (fh - qh * s) / 2], k);
+        return { start, end, perimeter };
+      }
+
+      function playStage() {
+        animations.forEach(a => a.cancel());
+        settled = false;
+        const g = placeStage();
+        if (!g) return;
+        if (reducedMotion) { stageOutline.style.strokeDashoffset = 0; settleStage(); return; }
         animations = [
-          stagePiece.animate([{ transform: start, opacity: 1 }, { transform: end, opacity: 1 }],
+          stagePiece.animate([{ transform: g.start, opacity: 1 }, { transform: g.end, opacity: 1 }],
                              { duration: 900, easing: "cubic-bezier(.2,.8,.2,1)", fill: "both" }),
           stageDim.animate([{ opacity: 0.7 }, { opacity: 0.7 }], { duration: 900, fill: "both" }),
-          stageOutline.animate([{ strokeDashoffset: perimeter }, { strokeDashoffset: 0 }],
+          stageOutline.animate([{ strokeDashoffset: g.perimeter }, { strokeDashoffset: 0 }],
                                { duration: 450, delay: 850, easing: "ease-out", fill: "both" }),
           stagePiece.animate([{ opacity: 1 }, { opacity: pieceSlider.value / 100 }],
                              { duration: 600, delay: 1250, easing: "ease-in-out", fill: "both" }),
           stageDim.animate([{ opacity: 0.7 }, { opacity: dimSlider.value / 100 }],
                            { duration: 600, delay: 1250, easing: "ease-in-out", fill: "both" }),
         ];
-        const last = animations[3];
-        last.finished.then(() => {
+        animations[3].finished.then(() => {
           stageOutline.style.strokeDashoffset = 0;
           animations.forEach(a => a.cancel());
           settleStage();
@@ -395,7 +417,9 @@
         });
       }
       document.querySelector("#replay").addEventListener("click", playStage);
-      addEventListener("resize", () => { if (settled) playStage(); });
+      // Resizing (including a phone's address bar showing or hiding) only
+      // repositions; it never replays the animation.
+      addEventListener("resize", () => { if (settled) placeStage(); });
 
       function renderResults(matches, upload) {
         if (uploadUrl) URL.revokeObjectURL(uploadUrl);
@@ -407,7 +431,7 @@
           const image = document.createElement("img");
           image.src = match.thumbnail;
           image.alt = `Match ${rank + 1}: indexed frame from ${match.title}`;
-          image.width = 220;
+          image.width = 200;
           const caption = document.createElement("figcaption");
           caption.textContent = `${rank + 1}. ${match.title} (${match.year}) · ${match.training_label} · ${clock(match.timestamp_seconds)} · frame ${match.frame_number} · similarity ${match.score.toFixed(3)}`
             + (match.confirmed ? ` · ✓ ${match.points} matching points` : "");
