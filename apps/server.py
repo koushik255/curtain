@@ -6,6 +6,7 @@ import html
 import io
 import json
 import time
+from bisect import bisect_left
 from functools import lru_cache
 from pathlib import Path
 from collections.abc import Iterator
@@ -39,6 +40,8 @@ TIMESTAMP_RECORDS = {
 # benchmark it flags ~45% of wrong-movie answers and ~11% of right ones.
 WEAK_SCORE = 0.70
 RESULTS = 5
+BENCHMARK_SUITE = LOCAL_ROOT / "benchmarks/validation-v1"
+BENCHMARK_RESULTS = LOCAL_ROOT / "benchmarks/results"
 
 
 class TrainedSearchEngine:
@@ -56,6 +59,7 @@ class TrainedSearchEngine:
         self.movies = []
         self.movie_lookup = {}
         self.source_dirs = {}
+        self.source_spans = {}
         known = {}
         catalog = json.loads((tile_search.FAISS_DIR / "catalog.json").read_text())
         names = catalog["names"]  # "<collection>/<movie>/<frame>.jpg" in frame-id order
@@ -68,6 +72,7 @@ class TrainedSearchEngine:
                 raise RuntimeError("Catalog frame ids are not contiguous.")
             source = entry["movie"]
             self.source_dirs[source] = (FRAME_ROOTS[collection].resolve(), name)
+            self.source_spans[source] = (start, count)
             timestamps = {}
             old = TIMESTAMP_RECORDS[collection] / name / "records.json"
             if old.exists():
@@ -167,6 +172,15 @@ class TrainedSearchEngine:
                 "server_total_ms": (finished - started) * 1000,
             },
         }
+
+    def frame_index(self, name: str) -> int | None:
+        # Row of "<collection>/<movie>/<frame>.jpg"; each span is sorted by filename.
+        source, _, filename = name.rpartition("/")
+        if source not in self.source_spans:
+            return None
+        start, count = self.source_spans[source]
+        row = bisect_left(self.records, filename, start, start + count, key=lambda r: r["filename"])
+        return row if row < start + count and self.records[row]["filename"] == filename else None
 
     def frame_path(self, index: int) -> Path | None:
         # Resolve a safe local source path for an indexed frame row.
@@ -343,7 +357,7 @@ def gallery():
         '<meta name="viewport" content="width=device-width,initial-scale=1">'
         "<title>Curtain trained-model test gallery</title></head><body>"
         '<h1>Curtain trained-model test gallery</h1><p><a href="/">Back to search</a></p>'
-        '<p><a href="/gallery">All movies</a></p>'
+        '<p><a href="/gallery">All movies</a> · <a href="/benchmarks">Benchmarks</a></p>'
         f'<p><a href="/movies">Movie training history and unseen movie list</a></p><p>{html.escape(EXPLANATION)}</p>'
         "<p>Examples from the indexed movies. Save or copy an image to test it on the search page.</p>"
         f'{filters}<p>{len(movie_list)} movies · {len(indices)} sample images</p>'
@@ -351,6 +365,91 @@ def gallery():
         f"{figures}</body></html>",
         mimetype="text/html",
     )
+
+
+@app.get("/benchmarks")
+def benchmarks():
+    # Render the latest validation-suite run: totals per query type, then every
+    # query image beside each system's top match.
+    runs = sorted(BENCHMARK_RESULTS.glob("*.json"))
+    if not runs:
+        return Response("<p>No benchmark runs yet.</p>", mimetype="text/html")
+    report = json.loads(runs[-1].read_text())
+    manifest = json.loads((BENCHMARK_SUITE / "manifest.json").read_text())
+    targets = {q["image"]: q["target"] for q in manifest["queries"]}
+    systems = report["systems"]
+    keys = list(systems)
+    types = list(dict.fromkeys(row["type"] for row in systems[keys[0]]["rows"]))
+    marks = [("exact", "✓ exact frame"), ("moment", "≈ same moment (±1 s)"),
+             ("movie", "~ right movie only"), (None, "✗ wrong movie")]
+
+    def verdict(row: dict) -> str:
+        return next(label for key, label in marks if key is None or row[key])
+
+    def frame_figure(name: str, caption: str) -> str:
+        index = engine.frame_index(name)
+        movie = name.split("/")[1].replace("_", " ")
+        frame = name.rsplit("_", 1)[-1].removesuffix(".jpg").lstrip("0")
+        image = (f'<a href="{url_for("frame_image", index=index)}"><img src="{url_for("frame_image", index=index, w=320)}" '
+                 f'width="200" loading="lazy" alt="{html.escape(movie, quote=True)} frame {frame}"></a>'
+                 if index is not None else "<p>(frame not in the index)</p>")
+        return f"<figure>{image}<figcaption>{html.escape(caption)}<br>{html.escape(movie)} · frame {frame}</figcaption></figure>"
+
+    def cell(rows: list[dict], metric: str) -> str:
+        return f"{sum(r[metric] for r in rows)}/{len(rows)}"
+
+    header = "".join(f"<th>{html.escape(systems[k]['label'])}</th>" for k in keys)
+    summary = []
+    for kind in types + ["all"]:
+        cells = "".join(
+            f"<td>{cell([r for r in systems[k]['rows'] if kind in ('all', r['type'])], 'exact')} exact · "
+            f"{cell([r for r in systems[k]['rows'] if kind in ('all', r['type'])], 'movie')} movie</td>"
+            for k in keys)
+        name = "all" if kind == "all" else f'<a href="#{kind}">{kind}</a>'
+        summary.append(f"<tr><th>{name}</th>{cells}</tr>")
+    timing = " · ".join(f"{html.escape(systems[k]['label'])}: {systems[k]['median_ms']:.0f} ms" for k in keys)
+
+    sections = []
+    for kind in types:
+        items = []
+        for n, row in enumerate(r for r in systems[keys[0]]["rows"] if r["type"] == kind):
+            image = row["image"]
+            per_system = [next(r for r in systems[k]["rows"] if r["image"] == image) for k in keys]
+            query_url = url_for("benchmark_query", kind=kind, name=Path(image).name)
+            figures = [f'<figure><img src="{query_url}" width="200" alt="{kind} query {n + 1}">'
+                       f'<figcaption>query · {html.escape(kind)} #{n + 1}</figcaption></figure>',
+                       frame_figure(targets[image], "correct frame")]
+            for k, result in zip(keys, per_system):
+                if result["found"]:
+                    figures.append(frame_figure(result["found"][0], f"{systems[k]['label']}: {verdict(result)}"))
+            items.append(f'<div style="display:flex;flex-wrap:wrap;gap:8px;align-items:flex-start">{"".join(figures)}</div><hr>')
+        sections.append(f'<h2 id="{kind}">{kind}</h2>{"".join(items)}')
+
+    movies = ", ".join(m.replace("_", " ") for m in manifest["movies"])
+    return Response(
+        '<!doctype html><html lang="en"><head><meta charset="utf-8">'
+        '<meta name="viewport" content="width=device-width,initial-scale=1"><title>Curtain benchmarks</title>'
+        '<style>table{border-collapse:collapse}td,th{border:1px solid #999;padding:4px 8px;text-align:left}'
+        'figure{margin:0;width:200px}figcaption{font-size:13px}img{max-width:100%;height:auto}</style>'
+        '</head><body><h1>Curtain benchmarks</h1><p><a href="/">Back to search</a></p>'
+        f'<p>{report["queries"]} test images in {len(types)} types, made only from validation movies '
+        f'that no model trained on: {html.escape(movies)}. Each row shows the query, the correct frame, '
+        'and every system’s top match.</p>'
+        f'<p>Run {html.escape(runs[-1].stem)} · median search time: {timing}</p>'
+        f'<table><tr><th>query type</th>{header}</tr>{"".join(summary)}</table>'
+        '<p>✓ exact frame · ≈ same moment (within 1 second) · ~ right movie, wrong moment · ✗ wrong movie</p>'
+        + "".join(sections) + "</body></html>",
+        mimetype="text/html",
+    )
+
+
+@app.get("/benchmarks/query/<kind>/<name>")
+def benchmark_query(kind: str, name: str):
+    # Serve one benchmark query image from the suite folder.
+    path = (BENCHMARK_SUITE / kind / name).resolve()
+    if path.parent.parent != BENCHMARK_SUITE.resolve() or path.suffix != ".jpg" or not path.is_file():
+        return jsonify(error="Query image not found."), 404
+    return send_file(path, conditional=True, max_age=0)
 
 
 @app.errorhandler(413)
