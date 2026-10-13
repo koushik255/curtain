@@ -53,8 +53,9 @@
       </form>
 
       <section id="results-area" hidden>
-        <h2>Closest match</h2>
-        <p>Cosine similarity, not probability.</p>
+        <h2>Closest matches</h2>
+        <p>Best first. Cosine similarity, not probability.</p>
+        <p id="weak-note" hidden><strong>Low confidence:</strong> the best score is under 0.70, so these may be from a different movie.</p>
         <div id="results" aria-live="polite"></div>
       </section>
     </main>
@@ -175,7 +176,7 @@
         tracker.hidden = false;
         trackerProgress.value = 0;
         trackerStage.textContent = "Uploading / waiting for server";
-        trackerDetail.textContent = "The server has not started traversing embeddings yet.";
+        trackerDetail.textContent = "The server has not started the search yet.";
         const started = performance.now();
         const timer = setInterval(() => {
           trackerTime.textContent = `${Math.round(performance.now() - started)} ms elapsed`;
@@ -219,34 +220,38 @@
           trackerStage.textContent = "Query embedding created";
           trackerDetail.textContent = `ResNet-18 embedding · ${event.embedding_ms.toFixed(1)} ms`;
         } else if (event.type === "progress") {
-          trackerStage.textContent = "Traversing embedding matrix";
+          trackerStage.textContent = "Searched the tile index";
           trackerProgress.max = event.total;
           trackerProgress.value = event.processed;
-          trackerDetail.textContent = `${event.processed.toLocaleString()} / ${event.total.toLocaleString()} embeddings · ${event.percent.toFixed(1)}% · ${Math.round(event.frames_per_second).toLocaleString()} frames/sec · ${event.retrieval_ms.toFixed(1)} ms`;
+          trackerDetail.textContent = `${event.total.toLocaleString()} tile vectors (49 tiles + whole frame per frame) · ${event.retrieval_ms.toFixed(1)} ms`;
         } else if (event.type === "result") {
           trackerStage.textContent = "Search complete";
           trackerProgress.value = trackerProgress.max;
-          renderResults([event.result]);
-          status.textContent = "Found the closest frame.";
-          timings.textContent = `${Math.round(performance.now() - browserStarted)} ms total · ${Math.round(event.timings.decode_ms)} ms decode · ${Math.round(event.timings.embedding_ms)} ms embedding · ${Math.round(event.timings.comparison_ms)} ms streamed retrieval`;
+          renderResults(event.results);
+          document.querySelector("#weak-note").hidden = !event.weak;
+          status.textContent = event.results.length
+            ? (event.weak ? "Found possible matches (low confidence)." : "Found the closest frames.")
+            : "No match found.";
+          timings.textContent = `${Math.round(performance.now() - browserStarted)} ms total · ${Math.round(event.timings.decode_ms)} ms decode · ${Math.round(event.timings.embedding_ms)} ms embedding · ${Math.round(event.timings.comparison_ms)} ms search`;
         }
       }
 
       function clock(seconds) {
+        if (seconds == null) return "time unknown";
         const value = Math.round(seconds);
         return `${String(Math.floor(value / 3600)).padStart(2, "0")}:${String(Math.floor((value % 3600) / 60)).padStart(2, "0")}:${String(value % 60).padStart(2, "0")}`;
       }
 
       function renderResults(matches) {
         results.replaceChildren();
-        matches.forEach(match => {
+        matches.forEach((match, rank) => {
           const card = document.createElement("figure");
           const image = document.createElement("img");
           image.src = match.image;
-          image.alt = `Closest indexed frame from ${match.title}`;
-          image.width = 640;
+          image.alt = `Match ${rank + 1}: indexed frame from ${match.title}`;
+          image.width = rank === 0 ? 640 : 320;
           const caption = document.createElement("figcaption");
-          caption.textContent = `${match.title} (${match.year}) · ${match.training_label} · ${clock(match.timestamp_seconds)} · frame ${match.frame_number} · similarity ${match.score.toFixed(3)}`;
+          caption.textContent = `${rank + 1}. ${match.title} (${match.year}) · ${match.training_label} · ${clock(match.timestamp_seconds)} · frame ${match.frame_number} · similarity ${match.score.toFixed(3)}`;
           card.append(image, caption);
           results.append(card);
         });

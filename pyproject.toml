@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "Exact-frame movie search with a contrastively trained ResNet-18"
 requires-python = ">=3.12"
 dependencies = [
+    "faiss-cpu>=1.9,<2",
     "flask>=3.1,<4",
     "modal>=1.5,<2",
     "numpy>=2.2,<3",

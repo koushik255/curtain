@@ -18,101 +18,95 @@ from curtain_ml.model import CurtainEncoder
 from curtain_ml.training import reference_transform
 from curtain_ml.retrieval import normalize_rows
 from curtain_ml.provenance import LABELS, EXPLANATION, category, load_split, movie_key
+from rcmindex import search as tile_search
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 LOCAL_ROOT = PROJECT_ROOT / ".local"
-DEFAULT_CHECKPOINT = LOCAL_ROOT / "trained_models/l4-50k-crop-v1-20260909/best.pt"
-DEFAULT_INDEX = LOCAL_ROOT / "trained_indexes/l4-50k-crop-v1"
-DEFAULT_EXTRA_INDEX = LOCAL_ROOT / "trained_indexes/l4-50k-lbfive-crop-v1"
-DEFAULT_FRAMES = LOCAL_ROOT / "screenshots"
+DEFAULT_CHECKPOINT = LOCAL_ROOT / "trained_models/combined-rocm-50k-v1/best.pt"
+# Frame folders per index collection, and the older per-frame records that
+# carry timestamps.
+FRAME_ROOTS = {
+    "full-curtain": LOCAL_ROOT / "screenshots",
+    "l4-50k-lbfive": Path("/home/koushik/lbfive/screenshots"),
+}
+TIMESTAMP_RECORDS = {
+    "full-curtain": LOCAL_ROOT / "trained_indexes/l4-50k-crop-v1",
+    "l4-50k-lbfive": LOCAL_ROOT / "trained_indexes/l4-50k-lbfive-crop-v1",
+}
+# Below this, the best match is shown with a low-confidence note. On the crop
+# benchmark it flags ~45% of wrong-movie answers and ~11% of right ones.
+WEAK_SCORE = 0.70
+RESULTS = 5
 
 
 class TrainedSearchEngine:
-    def __init__(self, checkpoint: Path, index_dir: Path, frames_dir: Path):
-        # Load the checkpoint and validate/merge the configured index collections.
+    def __init__(self, checkpoint: Path):
+        # Load the model, the FAISS tile index and per-frame records.
         device = "cuda" if torch.cuda.is_available() else "cpu"
         self.device = torch.device(device)
         self.model = CurtainEncoder.from_checkpoint(checkpoint, self.device)
         self.transform = reference_transform(self.model.image_size)
         checkpoint_hash = hashlib.sha256(checkpoint.read_bytes()).hexdigest()
         split = load_split(checkpoint, checkpoint_hash, PROJECT_ROOT)
+        self.search_index = tile_search.load()
 
         self.records = []
         self.movies = []
         self.movie_lookup = {}
         self.source_dirs = {}
-        matrices = []
-        collections = [(index_dir, frames_dir.resolve(), "")]
-        if index_dir.resolve() == DEFAULT_INDEX.resolve() and (
-            DEFAULT_EXTRA_INDEX / "collection.json"
-        ).exists():
-            collections.append(
-                (DEFAULT_EXTRA_INDEX, Path("/home/koushik/lbfive/screenshots"), "lbfive:")
-            )
-
         known = {}
-        for collection_dir, frame_root, prefix in collections:
-            collection = json.loads((collection_dir / "collection.json").read_text())
-            if collection.get("checkpoint_sha256") != checkpoint_hash:
-                raise RuntimeError(f"Collection does not match checkpoint: {collection_dir}")
-            collection_frames = 0
-            for entry in collection["movies"]:
-                name = entry["movie"]
-                if Path(name).name != name:
-                    raise RuntimeError("Invalid movie directory.")
-                folder = collection_dir / name
-                manifest = json.loads((folder / "manifest.json").read_text())
-                records = json.loads((folder / "records.json").read_text())
-                matrix = np.load(folder / "embeddings.npy").astype(np.float32)
-                if (
-                    manifest.get("checkpoint_sha256") != checkpoint_hash
-                    or matrix.shape != (entry["frames"], self.model.embedding_dim)
-                    or len(records) != len(matrix)
-                    or not np.isfinite(matrix).all()
-                    or any(
-                        record["movie"] != name
-                        or Path(record["filename"]).name != record["filename"]
-                        for record in records
-                    )
-                ):
-                    raise RuntimeError(f"Invalid index for {name}.")
+        catalog = json.loads((tile_search.FAISS_DIR / "catalog.json").read_text())
+        names = catalog["names"]  # "<collection>/<movie>/<frame>.jpg" in frame-id order
+        for entry in catalog["movies"]:
+            collection, name = entry["movie"].split("/")
+            if Path(name).name != name or collection not in FRAME_ROOTS:
+                raise RuntimeError(f"Invalid movie entry {entry['movie']}.")
+            start, count = entry["first"], entry["frames"]
+            if start != len(self.records):
+                raise RuntimeError("Catalog frame ids are not contiguous.")
+            source = entry["movie"]
+            self.source_dirs[source] = (FRAME_ROOTS[collection].resolve(), name)
+            timestamps = {}
+            old = TIMESTAMP_RECORDS[collection] / name / "records.json"
+            if old.exists():
+                timestamps = {r["filename"]: r["timestamp_seconds"] for r in json.loads(old.read_text())}
 
-                source = prefix + name
-                self.source_dirs[source] = (frame_root.resolve(), name)
-                start = len(self.records)
-                key = movie_key(name)
-                movie = known.get(key)
-                if movie is None:
-                    title, separator, year = name.rpartition("_")
-                    if not separator or not year.isdigit():
-                        title, year = name, ""
-                    status = category(name, split)
-                    movie = {
-                        "id": name,
-                        "title": title.replace("_", " "),
-                        "year": int(year) if year else None,
-                        "frames": 0,
-                        "spans": [],
-                        "training_status": status,
-                        "training_label": LABELS[status],
-                    }
-                    known[key] = movie
-                    self.movies.append(movie)
-                    self.movie_lookup[name] = movie
-                movie["spans"].append((start, len(records)))
-                movie["frames"] += len(records)
-                self.records.extend(
-                    dict(record, movie=movie["id"], source=source) for record in records
-                )
-                matrices.append(normalize_rows(matrix))
-                collection_frames += len(records)
-            if collection_frames != collection["total_frames"]:
-                raise RuntimeError(f"Collection frame count does not match: {collection_dir}")
-
-        if not matrices:
-            raise RuntimeError("No embeddings loaded.")
-        self.embeddings = np.concatenate(matrices)
+            key = movie_key(name)
+            movie = known.get(key)
+            if movie is None:
+                title, separator, year = name.rpartition("_")
+                if not separator or not year.isdigit():
+                    title, year = name, ""
+                status = category(name, split)
+                movie = {
+                    "id": name,
+                    "title": title.replace("_", " "),
+                    "year": int(year) if year else None,
+                    "frames": 0,
+                    "spans": [],
+                    "training_status": status,
+                    "training_label": LABELS[status],
+                }
+                known[key] = movie
+                self.movies.append(movie)
+                self.movie_lookup[name] = movie
+            movie["spans"].append((start, count))
+            movie["frames"] += count
+            for full in names[start:start + count]:
+                filename = full.rsplit("/", 1)[1]
+                if Path(filename).name != filename:
+                    raise RuntimeError(f"Invalid frame name {full}.")
+                self.records.append({
+                    "movie": movie["id"],
+                    "source": source,
+                    "filename": filename,
+                    "frame_number": int(Path(filename).stem.rsplit("_", 1)[1]),
+                    "timestamp_seconds": timestamps.get(filename),
+                })
+        if not self.records:
+            raise RuntimeError("No frames loaded.")
+        self.vectors = self.search_index["index"].ntotal
         self.catalog = [dict(movie, active=True) for movie in self.movies]
 
     def public_result(self, index: int, score: float) -> dict:
@@ -124,17 +118,20 @@ class TrainedSearchEngine:
                       image=url_for("frame_image", index=index))
         return record
 
-    def search_stream(self, data: bytes, chunk_size: int = 8192) -> Iterator[dict]:
-        # Yield decode, embedding, progress, and final-result events for one query.
+    def search_stream(self, data: bytes) -> Iterator[dict]:
+        # Yield decode, embedding, search, and final-result events for one query.
         started = time.perf_counter()
         with Image.open(io.BytesIO(data)) as image:
             image = ImageOps.exif_transpose(image).convert("RGB")
-        tensor = self.transform(image).unsqueeze(0).to(self.device)
+        # The whole query plus four overlapping pieces: a crop that covers only
+        # part of a frame still matches that frame's tiles piece by piece.
+        views = [image, *tile_search.pieces(image)]
+        tensor = torch.stack([self.transform(view) for view in views]).to(self.device)
         decoded = time.perf_counter()
         yield {"type": "stage", "stage": "decoded", "elapsed_ms": (decoded - started) * 1000}
 
         with torch.inference_mode():
-            query = normalize_rows(self.model(tensor).float().cpu().numpy())[0]
+            queries = normalize_rows(self.model(tensor).float().cpu().numpy())
         embedded = time.perf_counter()
         yield {
             "type": "stage",
@@ -143,38 +140,27 @@ class TrainedSearchEngine:
             "embedding_ms": (embedded - decoded) * 1000,
         }
 
-        best_index = -1
-        best_score = float("-inf")
-        total = len(self.embeddings)
-        search_started = time.perf_counter()
-        for offset in range(0, total, chunk_size):
-            end = min(offset + chunk_size, total)
-            scores = self.embeddings[offset:end] @ query
-            local_index = int(np.argmax(scores))
-            local_score = float(scores[local_index])
-            if local_score > best_score:
-                best_score = local_score
-                best_index = offset + local_index
-            elapsed = time.perf_counter() - search_started
-            yield {
-                "type": "progress",
-                "stage": "searching",
-                "processed": end,
-                "total": total,
-                "percent": end / total * 100,
-                "retrieval_ms": elapsed * 1000,
-                "frames_per_second": end / elapsed if elapsed else 0,
-            }
-
-        record = self.public_result(best_index, best_score)
+        found = tile_search.search(self.search_index, queries, top=RESULTS)
         finished = time.perf_counter()
         yield {
+            "type": "progress",
+            "stage": "searching",
+            "processed": self.vectors,
+            "total": self.vectors,
+            "percent": 100.0,
+            "retrieval_ms": (finished - embedded) * 1000,
+            "frames_per_second": len(self.records) / (finished - embedded),
+        }
+        results = [self.public_result(index, score) for index, score in found]
+        yield {
             "type": "result",
-            "result": record,
+            "result": results[0] if results else None,
+            "results": results,
+            "weak": not results or results[0]["score"] < WEAK_SCORE,
             "timings": {
                 "decode_ms": (decoded - started) * 1000,
                 "embedding_ms": (embedded - decoded) * 1000,
-                "comparison_ms": (finished - search_started) * 1000,
+                "comparison_ms": (finished - embedded) * 1000,
                 "server_total_ms": (finished - started) * 1000,
             },
         }
@@ -222,7 +208,7 @@ def home():
 def health():
     # Return a lightweight readiness and index-size check.
     return jsonify(status="ready", movies=len(engine.movies), frames=len(engine.records),
-                   model="Curtain ResNet-18 · 50k crop-v1")
+                   vectors=engine.vectors, model="Curtain ResNet-18 · combined tiles")
 
 
 @app.get("/api/movies")
@@ -252,7 +238,7 @@ def movie_catalog():
     return Response('<!doctype html><html lang="en"><head><meta charset="utf-8">'
         '<meta name="viewport" content="width=device-width,initial-scale=1"><title>Movie training history</title>'
         '</head><body><h1>Movie training history</h1><p><a href="/">Back to search</a></p>'
-        f'<p>Labels refer to the active 50k crop-v1 model.</p><p>{html.escape(EXPLANATION)}</p>'
+        f'<p>Labels refer to the active combined tile model.</p><p>{html.escape(EXPLANATION)}</p>'
         '<p>Unseen does not mean unindexed: indexing does not train the model. '
         'Only movies marked searchable now can return matches on this site.</p>'
         + ''.join(sections) + '</body></html>', mimetype='text/html')
@@ -361,7 +347,7 @@ def main() -> None:
     # Load the fixed active artifacts and start the Flask server.
     global engine
     args = parse_args()
-    engine = TrainedSearchEngine(DEFAULT_CHECKPOINT, DEFAULT_INDEX, DEFAULT_FRAMES)
+    engine = TrainedSearchEngine(DEFAULT_CHECKPOINT)
     app.run(host=args.host, port=args.port, threaded=False)
 
 

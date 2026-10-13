@@ -10,6 +10,7 @@ run ends, fails, or you press Ctrl-C.
 
     python3 rcmindex/droplet/launch.py                     # 5 random stored movies
     python3 rcmindex/droplet/launch.py --movies 0          # every stored movie not yet indexed
+    python3 rcmindex/droplet/launch.py --movies 0 --all --grids 3,2   # add 3x3 + 2x2 tiles
     python3 rcmindex/droplet/launch.py --repeat 60 --min-new 20
         # every 60 min, if 20+ new movies are in Spaces, index them; stops once all are done
     python3 rcmindex/droplet/launch.py --source local --movies 2 --seed 3
@@ -46,8 +47,15 @@ SETUP = r"""
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a
 echo "[setup] apt packages"
-apt-get update -qq >/dev/null 2>&1
-apt-get install -y -qq migraphx-dev libturbojpeg0-dev cmake rsync >/tmp/apt.log 2>&1 || { tail -20 /tmp/apt.log; exit 1; }
+# A fresh droplet's unattended-upgrades can hold the apt lock: wait for it, retry.
+APT=(apt-get -o DPkg::Lock::Timeout=600 -o Acquire::Retries=3)
+for attempt in 1 2 3 4 5; do
+  "${APT[@]}" update -qq >/tmp/apt.log 2>&1 &&
+    "${APT[@]}" install -y -qq migraphx-dev libturbojpeg0-dev cmake rsync >>/tmp/apt.log 2>&1 && break
+  echo "[setup] apt attempt $attempt failed: $(grep -E '^(E|Err):' /tmp/apt.log | tail -2)"
+  [ "$attempt" = 5 ] && { tail -20 /tmp/apt.log; exit 1; }
+  sleep 20
+done
 echo "[setup] build rcmindex"
 cd ~/curtain-rcmindex
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH=/opt/rocm >/dev/null
@@ -208,6 +216,7 @@ def main() -> None:
     parser.add_argument("--keep", action="store_true", help="don't delete the droplet afterwards")
     parser.add_argument("--destroy", action="store_true")
     parser.add_argument("--all", action="store_true", help="also re-index movies indexed before")
+    parser.add_argument("--grids", help="tile grids to compute, e.g. 3,2 (default: 4x4 tiles + whole frame)")
     parser.add_argument("--repeat", type=int, metavar="MINUTES", help="keep running batches of new movies")
     parser.add_argument("--min-new", type=int, default=20, help="with --repeat: new movies needed per run")
     args = parser.parse_args()
@@ -272,8 +281,9 @@ def main() -> None:
         ssh(ip, "bash -s", SETUP)
 
         command = "python3 -u ~/curtain-rcmindex/droplet/run_index.py"
-        if args.limit:
-            command += f" -- --limit {args.limit}"
+        extra = (["--limit", str(args.limit)] if args.limit else []) + (["--grids", args.grids] if args.grids else [])
+        if extra:
+            command += " -- " + " ".join(extra)
         if args.movies == 0:
             command = command.replace("run_index.py", "run_index.py --delete-frames")
         ssh(ip, command)  # GPU progress streams here, interleaved with transfer progress

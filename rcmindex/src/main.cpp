@@ -24,6 +24,7 @@
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <mutex>
 #include <optional>
@@ -66,7 +67,10 @@ struct Options {
     int slots = 3;
     int readers = 16;  // CPU decode threads
     std::size_t limit = 0;
-    bool global = false;  // also write one whole-frame embedding per frame
+    // Tile grids to index. Grid g runs the trunk at g*192 so each tile is 192 px
+    // (the query scale) and pools (2g-1)^2 half-stride tiles; grid 1 is the
+    // whole frame. Files: 4 -> <movie>.npy, 1 -> .global.npy, g -> .g<g>.npy.
+    std::vector<int> grids{4};
 };
 
 Options parse(std::span<char*> args) {
@@ -84,7 +88,13 @@ Options parse(std::span<char*> args) {
         else if (a == "--slots") o.slots = std::stoi(value(i));
         else if (a == "--readers") o.readers = std::stoi(value(i));
         else if (a == "--limit") o.limit = std::stoull(value(i));
-        else if (a == "--global") o.global = true;
+        else if (a == "--global") o.grids.push_back(1);
+        else if (a == "--grids") {
+            o.grids.clear();
+            std::string list = value(i);
+            for (const auto part : std::views::split(list, ','))
+                o.grids.push_back(std::stoi(std::string(part.begin(), part.end())));
+        }
         else if (a == "--movies-from") {
             if (value(i) != "-") throw std::runtime_error("--movies-from only supports '-' (stdin)");
             o.movies_from_stdin = true;
@@ -94,8 +104,11 @@ Options parse(std::span<char*> args) {
     if ((o.frames.empty() && !o.movies_from_stdin) || o.model.empty() || o.output.empty())
         throw std::runtime_error(
             "usage: rcmindex --model DIR (--frames DIR --output OUT.npy | --movies-from - --output DIR)\n"
-            "                [--batch 32] [--slots 3] [--readers 16] [--limit N] [--global]");
+            "                [--grids 4,3,2,1] [--global] [--batch 32] [--slots 3] [--readers 16] [--limit N]");
     if (o.slots < 2) throw std::runtime_error("--slots must be at least 2");
+    std::ranges::sort(o.grids, std::greater{});
+    o.grids.erase(std::ranges::unique(o.grids).begin(), o.grids.end());
+    if (o.grids.empty() || o.grids.back() < 1) throw std::runtime_error("--grids needs positive sizes");
     return o;
 }
 
@@ -291,8 +304,7 @@ struct Slot {
     std::vector<std::size_t> capacity;
     std::vector<FrameView> views;
     FrameView* device_views = nullptr;
-    __half* host_tiles = nullptr;   // pinned [batch, views, dim]
-    __half* host_global = nullptr;  // pinned [batch, dim]
+    std::vector<__half*> host_out;  // pinned [batch, views, dim] per scale
     hipEvent_t done{};
 };
 
@@ -388,46 +400,57 @@ void upload_stage(std::vector<Slot>& slots, Channel<int>& read_slots, Channel<in
 
 // ---------------------------------------------------------------- engine
 
+// One tile grid: its own trunk resolution, windows and output file.
+struct Scale {
+    int grid = 0;
+    int input = 0;   // trunk input side: grid * 192
+    int steps = 0;   // windows per side: 2*grid-1 (1 for the whole frame)
+    int window = 0;  // feature cells per tile
+    int views = 0;   // steps * steps
+    Trunk trunk;
+    __half* device_out = nullptr;
+    std::string suffix;  // output file suffix
+};
+
 // Everything that lives across movies: compiled trunks, weights, buffers, slots.
 struct Engine {
     Options options;
     Head head;
-    int tile_input = 0;  // 768
-    int steps = 0;       // 7
-    int views = 0;       // 49
-    int window = 0;      // 6 feature cells per tile
+    std::vector<Scale> scales;
+    int max_input = 0;
     hipStream_t stream{};
-    Trunk tiles;
-    std::optional<Trunk> whole;
     float* weight = nullptr;
     const float* bias = nullptr;
     std::size_t max_frame_height = 2160;
     float* scratch = nullptr;
-    __half* device_tiles = nullptr;
-    __half* device_global = nullptr;
     std::vector<Slot> slots;
 };
 
 void setup(Engine& e, const Options& o) {
     e.options = o;
     e.head = load_head(o.model);
-    e.tile_input = e.head.grid * e.head.image_size;
-    e.steps = 2 * e.head.grid - 1;
-    e.views = e.steps * e.steps;
     hip(hipStreamCreateWithFlags(&e.stream, hipStreamNonBlocking));
-    e.tiles = compile_trunk(o.model, o.batch, e.tile_input);
-    if (o.global) e.whole = compile_trunk(o.model, o.batch, e.head.image_size);
-    e.window = e.tiles.side / e.head.grid;
-    if (e.tiles.side % e.head.grid || e.window % 2)
-        throw std::runtime_error(std::format("feature map {} does not tile into {}x{} half-stride windows",
-                                             e.tiles.side, e.head.grid, e.head.grid));
+    for (const int g : o.grids) {
+        Scale s;
+        s.grid = g;
+        s.input = g * e.head.image_size;
+        s.steps = g == 1 ? 1 : 2 * g - 1;
+        s.trunk = compile_trunk(o.model, o.batch, s.input);
+        s.window = s.trunk.side / g;
+        if (s.trunk.side % g || (g > 1 && s.window % 2))
+            throw std::runtime_error(std::format("feature map {} does not tile into {}x{} half-stride windows",
+                                                 s.trunk.side, g, g));
+        s.views = s.steps * s.steps;
+        s.suffix = g == e.head.grid ? ".npy" : g == 1 ? ".global.npy" : std::format(".g{}.npy", g);
+        hip(hipMalloc(&s.device_out, sizeof(__half) * o.batch * s.views * e.head.dim));
+        e.max_input = std::max(e.max_input, s.input);
+        e.scales.push_back(std::move(s));
+    }
     const auto& w = e.head.weights;
     hip(hipMalloc(&e.weight, w.size() * sizeof(float)));
     hip(hipMemcpy(e.weight, w.data(), w.size() * sizeof(float), hipMemcpyHostToDevice));
     e.bias = e.weight + std::size_t(e.head.dim) * e.head.features;
-    hip(hipMalloc(&e.scratch, sizeof(float) * o.batch * 3 * e.max_frame_height * e.tile_input));
-    hip(hipMalloc(&e.device_tiles, sizeof(__half) * o.batch * e.views * e.head.dim));
-    hip(hipMalloc(&e.device_global, sizeof(__half) * o.batch * e.head.dim));
+    hip(hipMalloc(&e.scratch, sizeof(float) * o.batch * 3 * e.max_frame_height * e.max_input));
     e.slots.resize(o.slots);
     for (Slot& slot : e.slots) {
         slot.bytes.resize(o.batch);
@@ -437,40 +460,54 @@ void setup(Engine& e, const Options& o) {
         slot.capacity.assign(o.batch, 0);
         slot.views.resize(o.batch);
         hip(hipMalloc(&slot.device_views, sizeof(FrameView) * o.batch));
-        hip(hipHostMalloc(&slot.host_tiles, sizeof(__half) * o.batch * e.views * e.head.dim));
-        hip(hipHostMalloc(&slot.host_global, sizeof(__half) * o.batch * e.head.dim));
+        for (const Scale& s : e.scales) {
+            __half* host = nullptr;
+            hip(hipHostMalloc(&host, sizeof(__half) * o.batch * s.views * e.head.dim));
+            slot.host_out.push_back(host);
+        }
         hip(hipEventCreateWithFlags(&slot.done, hipEventDisableTiming));
     }
 }
 
-// Index one frame list into `output` (.npy) plus .records.json, .json and,
-// with --global, .global.npy. Returns frames per second.
-double index_frames(Engine& e, const Frames& frames, const fs::path& output) {
+fs::path with_suffix(const fs::path& base, std::string_view suffix) {
+    return fs::path(base).replace_extension().string() + std::string(suffix);
+}
+
+// Index one frame list. `base` is <dir>/<movie>.npy; each grid writes its own
+// .npy next to it, plus .records.json and a .json report. Returns frames/s.
+double index_frames(Engine& e, const Frames& frames, const fs::path& base) {
     const Options& o = e.options;
     const auto started = Clock::now();
     const std::size_t n = frames.paths.size();
     const int dim = e.head.dim;
-    const int views = e.views;
 
-    if (output.has_parent_path()) fs::create_directories(output.parent_path());
+    if (base.has_parent_path()) fs::create_directories(base.parent_path());
     {
-        std::ofstream records(fs::path(output).replace_extension(".records.json"));
+        std::ofstream records(with_suffix(base, ".records.json"));
         records << '[';
         for (std::size_t i = 0; i < n; ++i) records << (i ? ", " : "") << json_string(frames.names[i]);
         records << "]\n";
     }
 
-    std::FILE* tile_file = std::fopen(output.c_str(), "wb");
-    if (!tile_file) throw std::runtime_error("cannot write " + output.string());
-    const std::array<std::size_t, 3> tile_shape{n, std::size_t(views), std::size_t(dim)};
-    const std::size_t tile_data = write_npy_header(tile_file, tile_shape);
-    std::FILE* global_file = nullptr;
-    std::size_t global_data = 0;
-    if (o.global) {
-        const auto path = fs::path(output).replace_extension(".global.npy");
-        global_file = std::fopen(path.c_str(), "wb");
-        const std::array<std::size_t, 2> global_shape{n, std::size_t(dim)};
-        global_data = write_npy_header(global_file, global_shape);
+    struct Output {
+        std::FILE* file;
+        std::size_t data;  // byte offset of the array
+        std::size_t row;   // bytes per frame
+    };
+    std::vector<Output> outputs;
+    for (const Scale& s : e.scales) {
+        const fs::path path = with_suffix(base, s.suffix);
+        std::FILE* file = std::fopen(path.c_str(), "wb");
+        if (!file) throw std::runtime_error("cannot write " + path.string());
+        std::size_t data = 0;
+        if (s.grid == 1) {
+            const std::array<std::size_t, 2> shape{n, std::size_t(dim)};
+            data = write_npy_header(file, shape);
+        } else {
+            const std::array<std::size_t, 3> shape{n, std::size_t(s.views), std::size_t(dim)};
+            data = write_npy_header(file, shape);
+        }
+        outputs.push_back({file, data, std::size_t(s.views) * dim * sizeof(__half)});
     }
 
     Channel<int> free_slots, read_slots, decoded_slots;
@@ -489,13 +526,9 @@ double index_frames(Engine& e, const Frames& frames, const fs::path& output) {
         hip(hipEventSynchronize(slot.done));
         add(time.wait, seconds_since(t));
         t = Clock::now();
-        const std::size_t row = std::size_t(views) * dim * sizeof(__half);
-        std::fseek(tile_file, long(tile_data + slot.first * row), SEEK_SET);
-        std::fwrite(slot.host_tiles, row, slot.count, tile_file);
-        if (global_file) {
-            const std::size_t grow = dim * sizeof(__half);
-            std::fseek(global_file, long(global_data + slot.first * grow), SEEK_SET);
-            std::fwrite(slot.host_global, grow, slot.count, global_file);
+        for (std::size_t k = 0; k < outputs.size(); ++k) {
+            std::fseek(outputs[k].file, long(outputs[k].data + slot.first * outputs[k].row), SEEK_SET);
+            std::fwrite(slot.host_out[k], outputs[k].row, slot.count, outputs[k].file);
         }
         add(time.write, seconds_since(t));
         written += slot.count;
@@ -512,22 +545,17 @@ double index_frames(Engine& e, const Frames& frames, const fs::path& output) {
             hip(hipStreamSynchronize(e.stream));
             hip(hipFree(e.scratch));
             e.max_frame_height = slot.max_height;
-            hip(hipMalloc(&e.scratch, sizeof(float) * o.batch * 3 * e.max_frame_height * e.tile_input));
+            hip(hipMalloc(&e.scratch, sizeof(float) * o.batch * 3 * e.max_frame_height * e.max_input));
         }
-        resize_normalize(slot.device_views, slot.count, slot.max_height, e.tile_input, e.scratch,
-                         e.tiles.input, e.stream);
-        const __half* features = run_trunk(e.tiles, e.stream);
-        pool_project(features, slot.count, e.head.features, e.tiles.side, e.window, e.window / 2,
-                     e.steps, e.weight, e.bias, dim, e.device_tiles, e.stream);
-        hip(hipMemcpyAsync(slot.host_tiles, e.device_tiles, sizeof(__half) * slot.count * views * dim,
-                           hipMemcpyDeviceToHost, e.stream));
-        if (e.whole) {
-            resize_normalize(slot.device_views, slot.count, slot.max_height, e.head.image_size,
-                             e.scratch, e.whole->input, e.stream);
-            const __half* global_features = run_trunk(*e.whole, e.stream);
-            pool_project(global_features, slot.count, e.head.features, e.whole->side, e.whole->side,
-                         1, 1, e.weight, e.bias, dim, e.device_global, e.stream);
-            hip(hipMemcpyAsync(slot.host_global, e.device_global, sizeof(__half) * slot.count * dim,
+        for (std::size_t k = 0; k < e.scales.size(); ++k) {
+            Scale& s = e.scales[k];
+            resize_normalize(slot.device_views, slot.count, slot.max_height, s.input, e.scratch,
+                             s.trunk.input, e.stream);
+            const __half* features = run_trunk(s.trunk, e.stream);
+            pool_project(features, slot.count, e.head.features, s.trunk.side, s.window,
+                         s.grid == 1 ? s.window : s.window / 2, s.steps, e.weight, e.bias, dim,
+                         s.device_out, e.stream);
+            hip(hipMemcpyAsync(slot.host_out[k], s.device_out, sizeof(__half) * slot.count * s.views * dim,
                                hipMemcpyDeviceToHost, e.stream));
         }
         hip(hipEventRecord(slot.done, e.stream));
@@ -540,23 +568,28 @@ double index_frames(Engine& e, const Frames& frames, const fs::path& output) {
     close(free_slots);
     reader.join();
     decoder.join();
-    std::fclose(tile_file);
-    if (global_file) std::fclose(global_file);
+    for (const Output& out : outputs) std::fclose(out.file);
 
     const double elapsed = seconds_since(started);
+    int views = 0;
+    std::string grids;
+    for (const Scale& s : e.scales) {
+        views += s.views;
+        grids += std::format("{}{}", grids.empty() ? "" : ", ", s.grid);
+    }
     hipDeviceProp_t props{};
     hip(hipGetDeviceProperties(&props, 0));
-    std::ofstream report(fs::path(output).replace_extension(".json"));
+    std::ofstream report(with_suffix(base, ".json"));
     report << std::format(
-        "{{\n  \"gpu\": {},\n  \"frames\": {},\n  \"views_per_frame\": {},\n  \"embeddings\": {},\n"
-        "  \"global\": {},\n  \"elapsed_seconds\": {:.3f},\n  \"frames_per_second\": {:.1f},\n"
+        "{{\n  \"gpu\": {},\n  \"frames\": {},\n  \"grids\": [{}],\n  \"views_per_frame\": {},\n"
+        "  \"embeddings\": {},\n  \"elapsed_seconds\": {:.3f},\n  \"frames_per_second\": {:.1f},\n"
         "  \"views_per_second\": {:.1f},\n  \"batch_size\": {},\n  \"slots\": {},\n  \"readers\": {},\n"
         "  \"encoder\": \"migraphx_fp16_shared_trunk\",\n  \"decoder\": \"libjpeg-turbo\",\n"
         "  \"stage_seconds\": {{\"read_decode\": {:.3f}, \"upload\": {:.3f}, \"enqueue\": {:.3f}, "
         "\"gpu_wait\": {:.3f}, \"write\": {:.3f}}}\n}}\n",
-        json_string(props.name), n, views, n * views, o.global, elapsed, n / elapsed,
-        n * views / elapsed, o.batch, o.slots, o.readers, time.read.load(), time.decode.load(),
-        time.compute.load(), time.wait.load(), time.write.load());
+        json_string(props.name), n, grids, views, n * views, elapsed, n / elapsed, n * views / elapsed,
+        o.batch, o.slots, o.readers, time.read.load(), time.decode.load(), time.compute.load(),
+        time.wait.load(), time.write.load());
     return n / elapsed;
 }
 
@@ -567,7 +600,7 @@ int run(const Options& o) {
     if (!o.movies_from_stdin) {
         const Frames frames = list_frames(o.frames, o.frames, o.limit);
         if (frames.paths.empty()) throw std::runtime_error("no frames found");
-        std::cout << std::format("{} frames, {} views each, batch {}\n", frames.paths.size(), e.views, o.batch);
+        std::cout << std::format("{} frames, {} grids, batch {}\n", frames.paths.size(), e.scales.size(), o.batch);
         const double fps = index_frames(e, frames, o.output);
         std::cout << std::format("indexed {} frames ({:.0f} frames/s)\n", frames.paths.size(), fps);
         return 0;
