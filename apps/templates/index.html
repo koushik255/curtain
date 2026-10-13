@@ -14,10 +14,11 @@
       #movies-list { max-height: 55vh; overflow-y: auto; margin: 0; padding-left: 22px; }
       #movies-list li { margin-bottom: 8px; }
       /* Match stage: the upload glides onto its spot in the matched frame. */
-      /* The matched frame sits in the top-right column beside the upload form;
-         on narrow screens it goes between the form and the result list. */
-      main { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 640px); column-gap: 32px;
-        grid-template-areas: "head view" "form view" "list view"; align-items: start; }
+      /* Header across the top; below it the upload form and result list on the
+         left, the matched frame on the right level with the upload. On narrow
+         screens it goes between the form and the result list. */
+      main { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 720px); column-gap: 32px;
+        grid-template-areas: "head head" "form view" "list view"; align-items: start; }
       main > header { grid-area: head; }
       main > form { grid-area: form; }
       main > #results-area { grid-area: list; }
@@ -33,8 +34,10 @@
       .stage .piece { position: absolute; inset: 0; width: 100%; height: 100%; }
       .stage-controls { display: flex; flex-wrap: wrap; gap: 8px 24px; align-items: center; margin: 8px 0 16px; }
       .stage-controls label { display: inline-flex; gap: 8px; align-items: center; }
-      #results { display: flex; flex-wrap: wrap; gap: 12px; }
-      #results figure { margin: 0; width: 200px; cursor: pointer; }
+      /* Results stacked vertically: thumbnail with its details beside it. */
+      #results { display: flex; flex-direction: column; gap: 10px; max-width: 560px; }
+      #results figure { margin: 0; display: flex; gap: 12px; align-items: flex-start; cursor: pointer; }
+      #results figure img { flex: none; width: 200px; }
       #results figure[aria-current="true"] img { outline: 3px solid #2fbf71; }
       #results figcaption { font-size: 14px; }
     </style>
