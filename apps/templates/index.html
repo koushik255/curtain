@@ -13,13 +13,26 @@
         width: min(380px, 80vw); box-sizing: border-box; box-shadow: 0 3px 10px #0002; }
       #movies-list { max-height: 55vh; overflow-y: auto; margin: 0; padding-left: 22px; }
       #movies-list li { margin-bottom: 8px; }
+      /* Match stage: the upload glides onto its spot in the matched frame. */
+      .stage { position: relative; display: inline-block; max-width: 100%; overflow: hidden; background: #000; line-height: 0; }
+      .stage .frame { display: block; width: 640px; max-width: 100%; height: auto; }
+      .stage svg { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+      .stage .piece { position: absolute; left: 0; top: 0; transform-origin: 0 0; max-width: none;
+        box-shadow: 0 8px 30px #0008; will-change: transform, opacity; }
+      .stage .outline { fill: none; stroke: #2fbf71; stroke-linejoin: round; }
+      .stage-controls { display: flex; flex-wrap: wrap; gap: 8px 24px; align-items: center; margin: 8px 0 16px; }
+      .stage-controls label { display: inline-flex; gap: 8px; align-items: center; }
+      #results { display: flex; flex-wrap: wrap; gap: 12px; }
+      #results figure { margin: 0; width: 220px; cursor: pointer; }
+      #results figure[aria-current="true"] img { outline: 3px solid #2fbf71; }
+      #results figcaption { font-size: 14px; }
     </style>
   </head>
   <body>
     <main>
       <header>
         <h1>Curtain Lab</h1>
-        <p>Upload one frame. Our 50k-trained crop-v1 ResNet-18 searches every indexed frame across the movie collection.</p>
+        <p>Upload a screenshot or a crop of one. Our ResNet-18 compares it with 49 overlapping tiles of every indexed frame, then feature matching finds exactly where it sits in the best candidates.</p>
         <details class="movies-menu" id="movies-menu">
           <summary id="movies-label">Movies</summary>
           <div class="movies-panel"><p id="movies-description">Loading indexed movies…</p>
@@ -55,8 +68,22 @@
 
       <section id="results-area" hidden>
         <h2>Closest matches</h2>
-        <p>Best first. Cosine similarity, not probability.</p>
-        <p id="weak-note" hidden><strong>Low confidence:</strong> the best score is under 0.70, so these may be from a different movie.</p>
+        <p id="weak-note" hidden><strong>Low confidence:</strong> the top match could not be confirmed by feature matching and its similarity is under 0.70, so it may be from a different movie.</p>
+        <div class="stage" id="stage">
+          <img class="frame" id="stage-frame" alt="Matched frame" />
+          <img class="piece" id="stage-piece" alt="Your screenshot, placed where it matches" hidden />
+          <svg id="stage-overlay" preserveAspectRatio="none" aria-hidden="true">
+            <path id="stage-dim" fill="#000" fill-rule="evenodd"></path>
+            <polygon id="stage-outline" class="outline"></polygon>
+          </svg>
+        </div>
+        <div class="stage-controls">
+          <label>Screenshot opacity <input id="piece-opacity" type="range" min="0" max="100" value="35" /> <span id="piece-value">35%</span></label>
+          <label>Dim the rest <input id="dim-opacity" type="range" min="0" max="85" value="45" /> <span id="dim-value">45%</span></label>
+          <button id="replay" type="button">Replay</button>
+        </div>
+        <p id="stage-caption"></p>
+        <p>All matches, best first (click one to see where your screenshot sits). Similarity is cosine similarity, not probability.</p>
         <div id="results" aria-live="polite"></div>
       </section>
     </main>
@@ -234,7 +261,7 @@
             const lines = buffer.split("\n");
             buffer = lines.pop();
             for (const line of lines) {
-              if (line) handleSearchEvent(JSON.parse(line), started);
+              if (line) handleSearchEvent(JSON.parse(line), started, upload);
             }
             if (done) break;
           }
@@ -248,7 +275,7 @@
         }
       });
 
-      function handleSearchEvent(event, browserStarted) {
+      function handleSearchEvent(event, browserStarted, upload) {
         if (event.type === "error") throw new Error(event.error);
         if (event.type === "stage" && event.stage === "decoded") {
           trackerStage.textContent = "Image decoded and resized";
@@ -264,12 +291,12 @@
         } else if (event.type === "result") {
           trackerStage.textContent = "Search complete";
           trackerProgress.value = trackerProgress.max;
-          renderResults(event.results);
+          renderResults(event.results, upload);
           document.querySelector("#weak-note").hidden = !event.weak;
           status.textContent = event.results.length
             ? (event.weak ? "Found possible matches (low confidence)." : "Found the closest frames.")
             : "No match found.";
-          timings.textContent = `${Math.round(performance.now() - browserStarted)} ms total · ${Math.round(event.timings.decode_ms)} ms decode · ${Math.round(event.timings.embedding_ms)} ms embedding · ${Math.round(event.timings.comparison_ms)} ms search`;
+          timings.textContent = `${Math.round(performance.now() - browserStarted)} ms total · ${Math.round(event.timings.decode_ms)} ms decode · ${Math.round(event.timings.embedding_ms)} ms embedding · ${Math.round(event.timings.comparison_ms)} ms search · ${Math.round(event.timings.alignment_ms)} ms alignment`;
         }
       }
 
@@ -279,23 +306,123 @@
         return `${String(Math.floor(value / 3600)).padStart(2, "0")}:${String(Math.floor((value % 3600) / 60)).padStart(2, "0")}:${String(value % 60).padStart(2, "0")}`;
       }
 
-      function renderResults(matches) {
+      // ---- match stage: the upload glides onto where it sits in the frame ----
+      const stageFrame = document.querySelector("#stage-frame");
+      const stagePiece = document.querySelector("#stage-piece");
+      const stageOverlay = document.querySelector("#stage-overlay");
+      const stageDim = document.querySelector("#stage-dim");
+      const stageOutline = document.querySelector("#stage-outline");
+      const stageCaption = document.querySelector("#stage-caption");
+      const pieceSlider = document.querySelector("#piece-opacity");
+      const dimSlider = document.querySelector("#dim-opacity");
+      const reducedMotion = matchMedia("(prefers-reduced-motion: reduce)").matches;
+      let shown = null, animations = [], settled = false, uploadUrl = null;
+
+      // match.matrix [a, b, c, d, e, f] maps upload pixels to frame pixels, the
+      // same order as CSS matrix(); k converts frame pixels to displayed pixels.
+      const cssMatrix = (m, k) => `matrix(${m[0] * k},${m[1] * k},${m[2] * k},${m[3] * k},${m[4] * k},${m[5] * k})`;
+      const mapCorners = (m, w, h) => [[0, 0], [w, 0], [w, h], [0, h]]
+        .map(([x, y]) => [m[0] * x + m[2] * y + m[4], m[1] * x + m[3] * y + m[5]]);
+
+      function settleStage() {
+        settled = true;
+        stagePiece.style.opacity = pieceSlider.value / 100;
+        stageDim.style.opacity = dimSlider.value / 100;
+      }
+
+      function playStage() {
+        animations.forEach(a => a.cancel());
+        settled = false;
+        const match = shown;
+        const located = match && match.matrix && stageFrame.naturalWidth && stagePiece.naturalWidth;
+        stagePiece.hidden = !located;
+        stageOverlay.style.display = located ? "" : "none";
+        if (!located) return;
+        const fw = match.frame_width, fh = match.frame_height;
+        const qw = stagePiece.naturalWidth, qh = stagePiece.naturalHeight;
+        const k = stageFrame.clientWidth / fw;
+        const box = mapCorners(match.matrix, qw, qh);
+        stageOverlay.setAttribute("viewBox", `0 0 ${fw} ${fh}`);
+        stageOutline.setAttribute("points", box.map(p => p.join(",")).join(" "));
+        stageOutline.style.strokeWidth = 3 / k;
+        stageDim.setAttribute("d", `M0 0H${fw}V${fh}H0Z M${box.map(p => p.join(" ")).join(" L")}Z`);
+        const perimeter = stageOutline.getTotalLength();
+        stageOutline.style.strokeDasharray = perimeter;
+        stagePiece.style.width = `${qw}px`;
+        const end = cssMatrix(match.matrix, k);
+        stagePiece.style.transform = end;
+        if (reducedMotion) { stageOutline.style.strokeDashoffset = 0; settleStage(); return; }
+        const s = Math.min(0.6 * fw / qw, 0.8 * fh / qh);
+        const start = cssMatrix([s, 0, 0, s, (fw - qw * s) / 2, (fh - qh * s) / 2], k);
+        animations = [
+          stagePiece.animate([{ transform: start, opacity: 1 }, { transform: end, opacity: 1 }],
+                             { duration: 900, easing: "cubic-bezier(.2,.8,.2,1)", fill: "both" }),
+          stageDim.animate([{ opacity: 0.7 }, { opacity: 0.7 }], { duration: 900, fill: "both" }),
+          stageOutline.animate([{ strokeDashoffset: perimeter }, { strokeDashoffset: 0 }],
+                               { duration: 450, delay: 850, easing: "ease-out", fill: "both" }),
+          stagePiece.animate([{ opacity: 1 }, { opacity: pieceSlider.value / 100 }],
+                             { duration: 600, delay: 1250, easing: "ease-in-out", fill: "both" }),
+          stageDim.animate([{ opacity: 0.7 }, { opacity: dimSlider.value / 100 }],
+                           { duration: 600, delay: 1250, easing: "ease-in-out", fill: "both" }),
+        ];
+        const last = animations[3];
+        last.finished.then(() => {
+          stageOutline.style.strokeDashoffset = 0;
+          animations.forEach(a => a.cancel());
+          settleStage();
+        }, () => {});
+      }
+
+      function showMatch(match, figure) {
+        shown = match;
+        results.querySelectorAll("figure").forEach(f => f.setAttribute("aria-current", f === figure));
+        stageCaption.textContent = `${match.title} (${match.year}) · ${clock(match.timestamp_seconds)} · frame ${match.frame_number} · similarity ${match.score.toFixed(3)} · `
+          + (match.matrix ? `${match.points} matching points${match.confirmed ? " (confirmed)" : ""}`
+                          : "could not find where the screenshot sits in this frame");
+        let pending = 2;
+        const ready = () => { if (--pending === 0) playStage(); };
+        stageFrame.onload = ready;
+        stagePiece.onload = ready;
+        stageFrame.src = match.image;
+        if (stagePiece.src === uploadUrl && stagePiece.complete) ready(); else stagePiece.src = uploadUrl;
+      }
+
+      for (const slider of [pieceSlider, dimSlider]) {
+        slider.addEventListener("input", () => {
+          document.querySelector("#piece-value").textContent = `${pieceSlider.value}%`;
+          document.querySelector("#dim-value").textContent = `${dimSlider.value}%`;
+          if (settled) settleStage();
+        });
+      }
+      document.querySelector("#replay").addEventListener("click", playStage);
+      addEventListener("resize", () => { if (settled) playStage(); });
+
+      function renderResults(matches, upload) {
+        if (uploadUrl) URL.revokeObjectURL(uploadUrl);
+        uploadUrl = URL.createObjectURL(upload);  // the exact image the server aligned
         results.replaceChildren();
         matches.forEach((match, rank) => {
           const card = document.createElement("figure");
+          card.tabIndex = 0;
+          const image = document.createElement("img");
+          image.src = match.thumbnail;
+          image.alt = `Match ${rank + 1}: indexed frame from ${match.title}`;
+          image.width = 220;
+          const caption = document.createElement("figcaption");
+          caption.textContent = `${rank + 1}. ${match.title} (${match.year}) · ${match.training_label} · ${clock(match.timestamp_seconds)} · frame ${match.frame_number} · similarity ${match.score.toFixed(3)}`
+            + (match.confirmed ? ` · ✓ ${match.points} matching points` : "");
           const link = document.createElement("a");
           link.href = match.full_image;
-          const image = document.createElement("img");
-          image.src = rank === 0 ? match.image : match.thumbnail;
-          image.alt = `Match ${rank + 1}: indexed frame from ${match.title}`;
-          image.width = rank === 0 ? 640 : 320;
-          const caption = document.createElement("figcaption");
-          caption.textContent = `${rank + 1}. ${match.title} (${match.year}) · ${match.training_label} · ${clock(match.timestamp_seconds)} · frame ${match.frame_number} · similarity ${match.score.toFixed(3)}`;
-          link.append(image);
-          card.append(link, caption);
+          link.textContent = "full size";
+          link.addEventListener("click", event => event.stopPropagation());
+          caption.append(" · ", link);
+          card.append(image, caption);
+          card.addEventListener("click", () => showMatch(match, card));
+          card.addEventListener("keydown", event => { if (event.key === "Enter") showMatch(match, card); });
           results.append(card);
         });
         resultsArea.hidden = false;
+        if (matches.length) showMatch(matches[0], results.firstElementChild);
       }
     </script>
   </body>

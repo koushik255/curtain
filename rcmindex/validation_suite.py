@@ -173,28 +173,49 @@ def system_before() -> callable:
     return run
 
 
-def system_now(pieces_on: bool = True, upload: bool = True) -> callable:
+def system_now(pieces_on: bool = True, upload: bool = True, align_top: int = 0) -> callable:
     """The site now: combined model, FAISS over 4x4 tiles + whole frame,
-    the query plus 4 pieces, exact re-scoring, 640 px browser upload."""
-    from rcmindex import search
+    the query plus 4 pieces, exact re-scoring, 640 px browser upload; with
+    align_top, the best align_top frames are re-ordered by SIFT alignment."""
+    from concurrent.futures import ThreadPoolExecutor
+    from rcmindex import align, search
     model = CurtainEncoder.from_checkpoint(LOCAL / "trained_models/combined-rocm-50k-v1/best.pt")
     engine = search.load()
+    pool = ThreadPoolExecutor(8)
 
-    def run(image: Image.Image) -> list[str]:
+    def run(image: Image.Image) -> list[str] | tuple[list[str], dict]:
+        original_width = image.width
         if upload:
             image = browser_upload(image)
         views = [image, *search.pieces(image)] if pieces_on else [image]
         q = embed(model, views)
         q /= np.linalg.norm(q, axis=1, keepdims=True)
-        return [engine["names"][f] for f, _ in search.search(engine, q, top=TOP)]
+        names = [engine["names"][f] for f, _ in search.search(engine, q, top=max(TOP, align_top))]
+        if not align_top:
+            return names[:TOP]
+        query = align.features(np.asarray(image.convert("L")))
+
+        def check(name: str):
+            collection, rest = name.split("/", 1)
+            return align.align(query, align.frame_features(SOURCES[collection] / rest))
+        alignments = list(pool.map(check, names[:align_top]))
+        order = align.rerank(names[:align_top], alignments)
+        points, matrix = alignments[order[0]]
+        if matrix:  # express it for the original query image (before the 640 px upload)
+            s = image.width / original_width
+            matrix = [v * s for v in matrix[:4]] + matrix[4:]
+        return [names[i] for i in order][:TOP], {"points": points, "matrix": matrix}
     return run
 
 
 SYSTEMS = {
     "before": ("before: crop-v1, whole frames", system_before),
     "now-nopieces": ("now without pieces", lambda: system_now(pieces_on=False)),
-    "now": ("now: tiles + pieces (site)", system_now),
+    "now": ("now: tiles + pieces", system_now),
+    "now-align5": ("now + alignment, top 5", lambda: system_now(align_top=5)),
+    "now-align10": ("now + alignment (site)", lambda: system_now(align_top=10)),
 }
+DEFAULT_SYSTEMS = ["before", "now", "now-align10"]
 
 
 # ------------------------------------------------------------------ scoring
@@ -241,8 +262,9 @@ def run(selected: list[str]) -> None:
             t = time.perf_counter()
             found = system(image)
             latencies.append(time.perf_counter() - t)
+            found, extra = found if isinstance(found, tuple) else (found, {})
             rows.append({"type": query["type"], "image": query["image"], "found": found,
-                         **score(found, query["target"], times)})
+                         **extra, **score(found, query["target"], times)})
         report["systems"][key] = {"label": label, "rows": rows,
                                   "median_ms": float(np.median(latencies) * 1000)}
         del system
@@ -280,7 +302,7 @@ def main() -> None:
     m.add_argument("--per-type", type=int, default=10)
     m.add_argument("--seed", type=int, default=7)
     r = sub.add_parser("run")
-    r.add_argument("--systems", nargs="+", default=list(SYSTEMS), choices=list(SYSTEMS))
+    r.add_argument("--systems", nargs="+", default=DEFAULT_SYSTEMS, choices=list(SYSTEMS))
     args = parser.parse_args()
     if args.command == "make":
         make(args.per_type, args.seed)

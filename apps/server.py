@@ -7,6 +7,7 @@ import io
 import json
 import time
 from bisect import bisect_left
+from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
 from pathlib import Path
 from collections.abc import Iterator
@@ -20,6 +21,7 @@ from curtain_ml.model import CurtainEncoder
 from curtain_ml.training import reference_transform
 from curtain_ml.retrieval import normalize_rows
 from curtain_ml.provenance import LABELS, EXPLANATION, category, load_split, movie_key
+from rcmindex import align
 from rcmindex import search as tile_search
 
 
@@ -40,6 +42,11 @@ TIMESTAMP_RECORDS = {
 # benchmark it flags ~45% of wrong-movie answers and ~11% of right ones.
 WEAK_SCORE = 0.70
 RESULTS = 5
+# The best ALIGN_CANDIDATES frames are checked with SIFT alignment and the
+# confirmed ones moved to the front. Validation suite: exact frame 62 -> 76
+# of 110 queries, ~100 ms more per search.
+ALIGN_CANDIDATES = 10
+align_pool = ThreadPoolExecutor(8)
 BENCHMARK_SUITE = LOCAL_ROOT / "benchmarks/validation-v1"
 BENCHMARK_RESULTS = LOCAL_ROOT / "benchmarks/results"
 
@@ -115,9 +122,15 @@ class TrainedSearchEngine:
         self.vectors = self.search_index["index"].ntotal
         self.catalog = [dict(movie, active=True) for movie in self.movies]
 
-    def public_result(self, index: int, score: float) -> dict:
+    def public_result(self, index: int, score: float,
+                      alignment: tuple[int, list[float] | None, tuple[int, int]] | None = None) -> dict:
         # Convert an internal matrix row into the JSON shown by the web UI.
         record = dict(self.records[index])
+        if alignment:
+            points, matrix, (width, height) = alignment
+            # matrix maps uploaded-image pixels to frame pixels (CSS matrix order).
+            record.update(points=points, confirmed=points >= align.VERIFIED_POINTS, matrix=matrix,
+                          frame_width=width, frame_height=height)
         movie = self.movie_lookup[record["movie"]]
         record.update(index=index, score=score, title=movie["title"], year=movie["year"],
                       training_status=movie['training_status'], training_label=movie['training_label'],
@@ -148,7 +161,20 @@ class TrainedSearchEngine:
             "embedding_ms": (embedded - decoded) * 1000,
         }
 
-        found = tile_search.search(self.search_index, queries, top=RESULTS)
+        found = tile_search.search(self.search_index, queries, top=ALIGN_CANDIDATES)
+        searched = time.perf_counter()
+
+        # Find where the upload sits in each candidate; confirmed frames first.
+        query = align.features(np.asarray(image.convert("L")))
+
+        def locate(index: int):
+            path = self.frame_path(index)
+            if path is None:
+                return 0, None, (0, 0)
+            frame = align.frame_features(path)
+            return (*align.align(query, frame), frame.size)
+        alignments = list(align_pool.map(locate, [index for index, _ in found]))
+        order = align.rerank(found, alignments)[:RESULTS]
         finished = time.perf_counter()
         yield {
             "type": "progress",
@@ -156,19 +182,22 @@ class TrainedSearchEngine:
             "processed": self.vectors,
             "total": self.vectors,
             "percent": 100.0,
-            "retrieval_ms": (finished - embedded) * 1000,
-            "frames_per_second": len(self.records) / (finished - embedded),
+            "retrieval_ms": (searched - embedded) * 1000,
+            "frames_per_second": len(self.records) / (searched - embedded),
         }
-        results = [self.public_result(index, score) for index, score in found]
+        results = [self.public_result(*found[i], alignments[i]) for i in order]
+        top = results[0] if results else None
         yield {
             "type": "result",
-            "result": results[0] if results else None,
+            "result": top,
             "results": results,
-            "weak": not results or results[0]["score"] < WEAK_SCORE,
+            # Confirmed by alignment, or a high similarity score.
+            "weak": not top or (not top["confirmed"] and top["score"] < WEAK_SCORE),
             "timings": {
                 "decode_ms": (decoded - started) * 1000,
                 "embedding_ms": (embedded - decoded) * 1000,
-                "comparison_ms": (finished - embedded) * 1000,
+                "comparison_ms": (searched - embedded) * 1000,
+                "alignment_ms": (finished - searched) * 1000,
                 "server_total_ms": (finished - started) * 1000,
             },
         }
@@ -283,6 +312,13 @@ def search_stream():
 THUMBNAIL_WIDTHS = {320, 640}
 
 
+@lru_cache(maxsize=4096)
+def image_size(path: Path) -> tuple[int, int]:
+    # Pixel size from the file header, without decoding the image.
+    with Image.open(path) as image:
+        return image.size
+
+
 @lru_cache(maxsize=512)
 def thumbnail(path: Path, width: int) -> bytes:
     # Downscaled JPEG of a frame for result cards; recent ones stay in memory.
@@ -386,13 +422,26 @@ def benchmarks():
     def verdict(row: dict) -> str:
         return next(label for key, label in marks if key is None or row[key])
 
-    def frame_figure(name: str, caption: str) -> str:
+    def frame_figure(name: str, caption: str, query: Path | None = None, matrix: list[float] | None = None) -> str:
         index = engine.frame_index(name)
         movie = name.split("/")[1].replace("_", " ")
         frame = name.rsplit("_", 1)[-1].removesuffix(".jpg").lstrip("0")
-        image = (f'<a href="{url_for("frame_image", index=index)}"><img src="{url_for("frame_image", index=index, w=320)}" '
-                 f'width="200" loading="lazy" alt="{html.escape(movie, quote=True)} frame {frame}"></a>'
-                 if index is not None else "<p>(frame not in the index)</p>")
+        if index is None:
+            return f"<figure><p>(frame not in the index)</p><figcaption>{html.escape(caption)}</figcaption></figure>"
+        box = ""
+        if matrix and query is not None:
+            # Outline where the query sits: its corners mapped into frame pixels.
+            fw, fh = image_size(engine.frame_path(index))
+            qw, qh = image_size(query)
+            a, b, c, d, e, f = matrix
+            points = " ".join(f"{a * x + c * y + e:.1f},{b * x + d * y + f:.1f}"
+                              for x, y in ((0, 0), (qw, 0), (qw, qh), (0, qh)))
+            box = (f'<svg viewBox="0 0 {fw} {fh}" preserveAspectRatio="none" aria-hidden="true" '
+                   'style="position:absolute;inset:0;width:100%;height:100%;pointer-events:none">'
+                   f'<polygon points="{points}" fill="none" stroke="#2fbf71" stroke-width="{3 * fw / 200:.1f}"/></svg>')
+        image = (f'<a href="{url_for("frame_image", index=index)}" style="position:relative;display:block;line-height:0">'
+                 f'<img src="{url_for("frame_image", index=index, w=320)}" width="200" loading="lazy" '
+                 f'alt="{html.escape(movie, quote=True)} frame {frame}">{box}</a>')
         return f"<figure>{image}<figcaption>{html.escape(caption)}<br>{html.escape(movie)} · frame {frame}</figcaption></figure>"
 
     def cell(rows: list[dict], metric: str) -> str:
@@ -421,7 +470,11 @@ def benchmarks():
                        frame_figure(targets[image], "correct frame")]
             for k, result in zip(keys, per_system):
                 if result["found"]:
-                    figures.append(frame_figure(result["found"][0], f"{systems[k]['label']}: {verdict(result)}"))
+                    label = f"{systems[k]['label']}: {verdict(result)}"
+                    if result.get("points"):
+                        label += f" · {result['points']} matching points"
+                    figures.append(frame_figure(result["found"][0], label, BENCHMARK_SUITE / image,
+                                                result.get("matrix")))
             items.append(f'<div style="display:flex;flex-wrap:wrap;gap:8px;align-items:flex-start">{"".join(figures)}</div><hr>')
         sections.append(f'<h2 id="{kind}">{kind}</h2>{"".join(items)}')
 
@@ -437,7 +490,8 @@ def benchmarks():
         'and every system’s top match.</p>'
         f'<p>Run {html.escape(runs[-1].stem)} · median search time: {timing}</p>'
         f'<table><tr><th>query type</th>{header}</tr>{"".join(summary)}</table>'
-        '<p>✓ exact frame · ≈ same moment (within 1 second) · ~ right movie, wrong moment · ✗ wrong movie</p>'
+        '<p>✓ exact frame · ≈ same moment (within 1 second) · ~ right movie, wrong moment · ✗ wrong movie. '
+        'The green box shows where feature matching placed the query in the site’s top match.</p>'
         + "".join(sections) + "</body></html>",
         mimetype="text/html",
     )
