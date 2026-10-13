@@ -30,7 +30,6 @@
       .stage .frame { display: block; width: 100%; height: auto; }
       .stage svg { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
       .stage .piece { position: absolute; left: 0; top: 0; transform-origin: 0 0; max-width: none; }
-      .stage .outline { fill: none; stroke: #2fbf71; stroke-linejoin: round; }
       .stage-controls { display: flex; flex-wrap: wrap; gap: 8px 24px; align-items: center; margin: 8px 0 16px; }
       .stage-controls label { display: inline-flex; gap: 8px; align-items: center; }
       #results { display: flex; flex-wrap: wrap; gap: 12px; }
@@ -90,12 +89,11 @@
           <img class="piece" id="stage-piece" alt="Your screenshot, placed where it matches" hidden />
           <svg id="stage-overlay" preserveAspectRatio="none" aria-hidden="true">
             <path id="stage-dim" fill="#000" fill-rule="evenodd"></path>
-            <polygon id="stage-outline" class="outline"></polygon>
           </svg>
         </div>
         <p id="stage-caption"></p>
         <div class="stage-controls">
-          <label>Snippet opacity <input id="piece-opacity" type="range" min="0" max="100" value="35" /> <span id="piece-value">35%</span></label>
+          <label>Snippet brightness <input id="piece-brightness" type="range" min="50" max="250" value="140" /> <span id="piece-value">140%</span></label>
           <label>Dim the rest <input id="dim-opacity" type="range" min="0" max="85" value="45" /> <span id="dim-value">45%</span></label>
         </div>
       </aside>
@@ -326,9 +324,8 @@
       const stagePiece = document.querySelector("#stage-piece");
       const stageOverlay = document.querySelector("#stage-overlay");
       const stageDim = document.querySelector("#stage-dim");
-      const stageOutline = document.querySelector("#stage-outline");
       const stageCaption = document.querySelector("#stage-caption");
-      const pieceSlider = document.querySelector("#piece-opacity");
+      const pieceSlider = document.querySelector("#piece-brightness");
       const dimSlider = document.querySelector("#dim-opacity");
       let shown = null, uploadUrl = null;
 
@@ -338,7 +335,8 @@
       const mapCorners = (m, w, h) => [[0, 0], [w, 0], [w, h], [0, h]]
         .map(([x, y]) => [m[0] * x + m[2] * y + m[4], m[1] * x + m[3] * y + m[5]]);
 
-      // Put the snippet on its spot, outline it, and apply the two sliders.
+      // Put the snippet on its spot and apply the two sliders. It covers the
+      // identical pixels of the frame, so it is set apart by brightness, not opacity.
       function placeStage() {
         const match = shown;
         const located = match && match.matrix && stageFrame.naturalWidth && stagePiece.naturalWidth;
@@ -350,8 +348,6 @@
         const k = stageFrame.clientWidth / fw;
         const box = mapCorners(match.matrix, qw, qh);
         stageOverlay.setAttribute("viewBox", `0 0 ${fw} ${fh}`);
-        stageOutline.setAttribute("points", box.map(p => p.join(",")).join(" "));
-        stageOutline.style.strokeWidth = 3 / k;
         stageDim.setAttribute("d", `M0 0H${fw}V${fh}H0Z M${box.map(p => p.join(" ")).join(" L")}Z`);
         stagePiece.style.width = `${qw}px`;
         stagePiece.style.transform = cssMatrix(match.matrix, k);
@@ -361,7 +357,7 @@
       function applySliders() {
         document.querySelector("#piece-value").textContent = `${pieceSlider.value}%`;
         document.querySelector("#dim-value").textContent = `${dimSlider.value}%`;
-        stagePiece.style.opacity = pieceSlider.value / 100;
+        stagePiece.style.filter = `brightness(${pieceSlider.value / 100})`;
         stageDim.style.opacity = dimSlider.value / 100;
       }
 
