@@ -29,7 +29,8 @@
       .stage { position: relative; display: block; width: 100%; overflow: hidden; background: #000; line-height: 0; }
       .stage .frame { display: block; width: 100%; height: auto; }
       .stage svg { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
-      .stage .piece { position: absolute; left: 0; top: 0; transform-origin: 0 0; max-width: none; }
+      /* A second copy of the frame, clipped to the snippet: at 0% it is identical. */
+      .stage .piece { position: absolute; inset: 0; width: 100%; height: 100%; }
       .stage-controls { display: flex; flex-wrap: wrap; gap: 8px 24px; align-items: center; margin: 8px 0 16px; }
       .stage-controls label { display: inline-flex; gap: 8px; align-items: center; }
       #results { display: flex; flex-wrap: wrap; gap: 12px; }
@@ -86,15 +87,15 @@
       <aside class="match-view" id="match-view" hidden>
         <div class="stage" id="stage">
           <img class="frame" id="stage-frame" alt="Matched frame" />
-          <img class="piece" id="stage-piece" alt="Your screenshot, placed where it matches" hidden />
+          <img class="piece" id="stage-piece" alt="" hidden />
           <svg id="stage-overlay" preserveAspectRatio="none" aria-hidden="true">
             <path id="stage-dim" fill="#000" fill-rule="evenodd"></path>
           </svg>
         </div>
         <p id="stage-caption"></p>
         <div class="stage-controls">
-          <label>Snippet brightness <input id="piece-brightness" type="range" min="50" max="250" value="140" /> <span id="piece-value">140%</span></label>
-          <label>Dim the rest <input id="dim-opacity" type="range" min="0" max="85" value="45" /> <span id="dim-value">45%</span></label>
+          <label>Highlight snippet <input id="piece-brightness" type="range" min="0" max="150" value="0" /> <span id="piece-value">0%</span></label>
+          <label>Dim the rest <input id="dim-opacity" type="range" min="0" max="85" value="0" /> <span id="dim-value">0%</span></label>
         </div>
       </aside>
     </main>
@@ -304,7 +305,7 @@
         } else if (event.type === "result") {
           trackerStage.textContent = "Search complete";
           trackerProgress.value = trackerProgress.max;
-          renderResults(event.results, upload);
+          renderResults(event.results);
           document.querySelector("#weak-note").hidden = !event.weak;
           status.textContent = event.results.length
             ? (event.weak ? "Found possible matches (low confidence)." : "Found the closest frames.")
@@ -327,37 +328,28 @@
       const stageCaption = document.querySelector("#stage-caption");
       const pieceSlider = document.querySelector("#piece-brightness");
       const dimSlider = document.querySelector("#dim-opacity");
-      let shown = null, uploadUrl = null;
+      let shown = null;
 
-      // match.matrix [a, b, c, d, e, f] maps upload pixels to frame pixels, the
-      // same order as CSS matrix(); k converts frame pixels to displayed pixels.
-      const cssMatrix = (m, k) => `matrix(${m[0] * k},${m[1] * k},${m[2] * k},${m[3] * k},${m[4] * k},${m[5] * k})`;
-      const mapCorners = (m, w, h) => [[0, 0], [w, 0], [w, h], [0, h]]
-        .map(([x, y]) => [m[0] * x + m[2] * y + m[4], m[1] * x + m[3] * y + m[5]]);
-
-      // Put the snippet on its spot and apply the two sliders. It covers the
-      // identical pixels of the frame, so it is set apart by brightness, not opacity.
+      // The snippet is a copy of the frame itself clipped to match.box (the
+      // upload's corners in frame pixels), so it can only differ by the
+      // highlight; at 0% it is pixel-identical to the frame.
       function placeStage() {
         const match = shown;
-        const located = match && match.matrix && stageFrame.naturalWidth && stagePiece.naturalWidth;
+        const located = match && match.box && stageFrame.naturalWidth;
         stagePiece.hidden = !located;
         stageOverlay.style.display = located ? "" : "none";
         if (!located) return;
-        const fw = match.frame_width, fh = match.frame_height;
-        const qw = stagePiece.naturalWidth, qh = stagePiece.naturalHeight;
-        const k = stageFrame.clientWidth / fw;
-        const box = mapCorners(match.matrix, qw, qh);
+        const fw = match.frame_width, fh = match.frame_height, box = match.box;
         stageOverlay.setAttribute("viewBox", `0 0 ${fw} ${fh}`);
         stageDim.setAttribute("d", `M0 0H${fw}V${fh}H0Z M${box.map(p => p.join(" ")).join(" L")}Z`);
-        stagePiece.style.width = `${qw}px`;
-        stagePiece.style.transform = cssMatrix(match.matrix, k);
+        stagePiece.style.clipPath = `polygon(${box.map(([x, y]) => `${x / fw * 100}% ${y / fh * 100}%`).join(", ")})`;
         applySliders();
       }
 
       function applySliders() {
         document.querySelector("#piece-value").textContent = `${pieceSlider.value}%`;
         document.querySelector("#dim-value").textContent = `${dimSlider.value}%`;
-        stagePiece.style.filter = `brightness(${pieceSlider.value / 100})`;
+        stagePiece.style.filter = `brightness(${1 + pieceSlider.value / 100})`;
         stageDim.style.opacity = dimSlider.value / 100;
       }
 
@@ -367,20 +359,16 @@
         stageCaption.textContent = `${match.title} (${match.year}) · ${clock(match.timestamp_seconds)} · frame ${match.frame_number} · similarity ${match.score.toFixed(3)} · `
           + (match.matrix ? `${match.points} matching points${match.confirmed ? " (confirmed)" : ""}`
                           : "could not find where the screenshot sits in this frame");
-        let pending = 2;
-        const ready = () => { if (--pending === 0) placeStage(); };
-        stageFrame.onload = ready;
-        stagePiece.onload = ready;
-        stageFrame.src = match.image;
-        if (stagePiece.src === uploadUrl && stagePiece.complete) ready(); else stagePiece.src = uploadUrl;
+        stageFrame.onload = placeStage;
+        stagePiece.src = match.image;
+        if (stageFrame.getAttribute("src") === match.image && stageFrame.complete) placeStage();
+        else stageFrame.src = match.image;
       }
 
       for (const slider of [pieceSlider, dimSlider]) slider.addEventListener("input", applySliders);
       addEventListener("resize", placeStage);
 
-      function renderResults(matches, upload) {
-        if (uploadUrl) URL.revokeObjectURL(uploadUrl);
-        uploadUrl = URL.createObjectURL(upload);  // the exact image the server aligned
+      function renderResults(matches) {
         results.replaceChildren();
         matches.forEach((match, rank) => {
           const card = document.createElement("figure");

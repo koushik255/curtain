@@ -123,7 +123,8 @@ class TrainedSearchEngine:
         self.catalog = [dict(movie, active=True) for movie in self.movies]
 
     def public_result(self, index: int, score: float,
-                      alignment: tuple[int, list[float] | None, tuple[int, int]] | None = None) -> dict:
+                      alignment: tuple[int, list[float] | None, tuple[int, int]] | None = None,
+                      query_size: tuple[int, int] | None = None) -> dict:
         # Convert an internal matrix row into the JSON shown by the web UI.
         record = dict(self.records[index])
         if alignment:
@@ -131,6 +132,12 @@ class TrainedSearchEngine:
             # matrix maps uploaded-image pixels to frame pixels (CSS matrix order).
             record.update(points=points, confirmed=points >= align.VERIFIED_POINTS, matrix=matrix,
                           frame_width=width, frame_height=height)
+            if matrix and query_size:
+                # Where the upload sits: its corners in frame pixels.
+                a, b, c, d, e, f = matrix
+                qw, qh = query_size
+                record["box"] = [[a * x + c * y + e, b * x + d * y + f]
+                                 for x, y in ((0, 0), (qw, 0), (qw, qh), (0, qh))]
         movie = self.movie_lookup[record["movie"]]
         record.update(index=index, score=score, title=movie["title"], year=movie["year"],
                       training_status=movie['training_status'], training_label=movie['training_label'],
@@ -185,7 +192,7 @@ class TrainedSearchEngine:
             "retrieval_ms": (searched - embedded) * 1000,
             "frames_per_second": len(self.records) / (searched - embedded),
         }
-        results = [self.public_result(*found[i], alignments[i]) for i in order]
+        results = [self.public_result(*found[i], alignments[i], image.size) for i in order]
         top = results[0] if results else None
         yield {
             "type": "result",
