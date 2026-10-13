@@ -14,20 +14,22 @@
       #movies-list { max-height: 55vh; overflow-y: auto; margin: 0; padding-left: 22px; }
       #movies-list li { margin-bottom: 8px; }
       /* Match stage: the upload glides onto its spot in the matched frame. */
-      /* Results on the left, the match stage on the right (stacked on narrow screens). */
-      .match-layout { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 640px); gap: 24px; align-items: start; }
-      .match-list { order: 1; }
-      .match-view { order: 2; position: sticky; top: 12px; }
+      /* The matched frame sits in the top-right column beside the upload form;
+         on narrow screens it goes between the form and the result list. */
+      main { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 640px); column-gap: 32px;
+        grid-template-areas: "head view" "form view" "list view"; align-items: start; }
+      main > header { grid-area: head; }
+      main > form { grid-area: form; }
+      main > #results-area { grid-area: list; }
+      main > .match-view { grid-area: view; position: sticky; top: 12px; }
       @media (max-width: 900px) {
-        .match-layout { grid-template-columns: minmax(0, 1fr); }
-        .match-view { order: 1; position: static; }
-        .match-list { order: 2; }
+        main { grid-template-columns: minmax(0, 1fr); grid-template-areas: "head" "form" "view" "list"; }
+        main > .match-view { position: static; }
       }
       .stage { position: relative; display: block; width: 100%; overflow: hidden; background: #000; line-height: 0; }
       .stage .frame { display: block; width: 100%; height: auto; }
       .stage svg { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
-      .stage .piece { position: absolute; left: 0; top: 0; transform-origin: 0 0; max-width: none;
-        box-shadow: 0 8px 30px #0008; will-change: transform, opacity; }
+      .stage .piece { position: absolute; left: 0; top: 0; transform-origin: 0 0; max-width: none; }
       .stage .outline { fill: none; stroke: #2fbf71; stroke-linejoin: round; }
       .stage-controls { display: flex; flex-wrap: wrap; gap: 8px 24px; align-items: center; margin: 8px 0 16px; }
       .stage-controls label { display: inline-flex; gap: 8px; align-items: center; }
@@ -78,29 +80,25 @@
       <section id="results-area" hidden>
         <h2>Closest matches</h2>
         <p id="weak-note" hidden><strong>Low confidence:</strong> the top match could not be confirmed by feature matching and its similarity is under 0.70, so it may be from a different movie.</p>
-        <div class="match-layout">
-          <div class="match-list">
-            <p>All matches, best first. Click one to see where your screenshot sits. Similarity is cosine similarity, not probability.</p>
-            <div id="results" aria-live="polite"></div>
-          </div>
-          <div class="match-view">
-            <div class="stage" id="stage">
-              <img class="frame" id="stage-frame" alt="Matched frame" />
-              <img class="piece" id="stage-piece" alt="Your screenshot, placed where it matches" hidden />
-              <svg id="stage-overlay" preserveAspectRatio="none" aria-hidden="true">
-                <path id="stage-dim" fill="#000" fill-rule="evenodd"></path>
-                <polygon id="stage-outline" class="outline"></polygon>
-              </svg>
-            </div>
-            <p id="stage-caption"></p>
-            <div class="stage-controls">
-              <label>Screenshot opacity <input id="piece-opacity" type="range" min="0" max="100" value="35" /> <span id="piece-value">35%</span></label>
-              <label>Dim the rest <input id="dim-opacity" type="range" min="0" max="85" value="45" /> <span id="dim-value">45%</span></label>
-              <button id="replay" type="button">Replay</button>
-            </div>
-          </div>
-        </div>
+        <p>All matches, best first. Click one to see where your screenshot sits. Similarity is cosine similarity, not probability.</p>
+        <div id="results" aria-live="polite"></div>
       </section>
+
+      <aside class="match-view" id="match-view" hidden>
+        <div class="stage" id="stage">
+          <img class="frame" id="stage-frame" alt="Matched frame" />
+          <img class="piece" id="stage-piece" alt="Your screenshot, placed where it matches" hidden />
+          <svg id="stage-overlay" preserveAspectRatio="none" aria-hidden="true">
+            <path id="stage-dim" fill="#000" fill-rule="evenodd"></path>
+            <polygon id="stage-outline" class="outline"></polygon>
+          </svg>
+        </div>
+        <p id="stage-caption"></p>
+        <div class="stage-controls">
+          <label>Snippet opacity <input id="piece-opacity" type="range" min="0" max="100" value="35" /> <span id="piece-value">35%</span></label>
+          <label>Dim the rest <input id="dim-opacity" type="range" min="0" max="85" value="45" /> <span id="dim-value">45%</span></label>
+        </div>
+      </aside>
     </main>
 
     <script>
@@ -219,6 +217,7 @@
         preview.hidden = false;
         copy.hidden = true;
         resultsArea.hidden = true;
+        document.querySelector("#match-view").hidden = true;
       }
 
       input.addEventListener("change", () => selectImage(input.files[0]));
@@ -252,6 +251,7 @@
         status.textContent = "Sending the query image…";
         timings.textContent = "";
         resultsArea.hidden = true;
+        document.querySelector("#match-view").hidden = true;
         tracker.hidden = false;
         trackerProgress.value = 0;
         trackerStage.textContent = "Uploading / waiting for server";
@@ -321,7 +321,7 @@
         return `${String(Math.floor(value / 3600)).padStart(2, "0")}:${String(Math.floor((value % 3600) / 60)).padStart(2, "0")}:${String(value % 60).padStart(2, "0")}`;
       }
 
-      // ---- match stage: the upload glides onto where it sits in the frame ----
+      // ---- match view: the upload shown on its spot in the matched frame ----
       const stageFrame = document.querySelector("#stage-frame");
       const stagePiece = document.querySelector("#stage-piece");
       const stageOverlay = document.querySelector("#stage-overlay");
@@ -330,8 +330,7 @@
       const stageCaption = document.querySelector("#stage-caption");
       const pieceSlider = document.querySelector("#piece-opacity");
       const dimSlider = document.querySelector("#dim-opacity");
-      const reducedMotion = matchMedia("(prefers-reduced-motion: reduce)").matches;
-      let shown = null, animations = [], settled = false, uploadUrl = null;
+      let shown = null, uploadUrl = null;
 
       // match.matrix [a, b, c, d, e, f] maps upload pixels to frame pixels, the
       // same order as CSS matrix(); k converts frame pixels to displayed pixels.
@@ -339,20 +338,13 @@
       const mapCorners = (m, w, h) => [[0, 0], [w, 0], [w, h], [0, h]]
         .map(([x, y]) => [m[0] * x + m[2] * y + m[4], m[1] * x + m[3] * y + m[5]]);
 
-      function settleStage() {
-        settled = true;
-        stagePiece.style.opacity = pieceSlider.value / 100;
-        stageDim.style.opacity = dimSlider.value / 100;
-      }
-
-      // Size the overlay for the current layout and put everything in its final
-      // place; returns the animation endpoints, or null if there is no box.
+      // Put the snippet on its spot, outline it, and apply the two sliders.
       function placeStage() {
         const match = shown;
         const located = match && match.matrix && stageFrame.naturalWidth && stagePiece.naturalWidth;
         stagePiece.hidden = !located;
         stageOverlay.style.display = located ? "" : "none";
-        if (!located) return null;
+        if (!located) return;
         const fw = match.frame_width, fh = match.frame_height;
         const qw = stagePiece.naturalWidth, qh = stagePiece.naturalHeight;
         const k = stageFrame.clientWidth / fw;
@@ -361,38 +353,16 @@
         stageOutline.setAttribute("points", box.map(p => p.join(",")).join(" "));
         stageOutline.style.strokeWidth = 3 / k;
         stageDim.setAttribute("d", `M0 0H${fw}V${fh}H0Z M${box.map(p => p.join(" ")).join(" L")}Z`);
-        const perimeter = stageOutline.getTotalLength();
-        stageOutline.style.strokeDasharray = perimeter;
         stagePiece.style.width = `${qw}px`;
-        const end = cssMatrix(match.matrix, k);
-        stagePiece.style.transform = end;
-        const s = Math.min(0.6 * fw / qw, 0.8 * fh / qh);
-        const start = cssMatrix([s, 0, 0, s, (fw - qw * s) / 2, (fh - qh * s) / 2], k);
-        return { start, end, perimeter };
+        stagePiece.style.transform = cssMatrix(match.matrix, k);
+        applySliders();
       }
 
-      function playStage() {
-        animations.forEach(a => a.cancel());
-        settled = false;
-        const g = placeStage();
-        if (!g) return;
-        if (reducedMotion) { stageOutline.style.strokeDashoffset = 0; settleStage(); return; }
-        animations = [
-          stagePiece.animate([{ transform: g.start, opacity: 1 }, { transform: g.end, opacity: 1 }],
-                             { duration: 900, easing: "cubic-bezier(.2,.8,.2,1)", fill: "both" }),
-          stageDim.animate([{ opacity: 0.7 }, { opacity: 0.7 }], { duration: 900, fill: "both" }),
-          stageOutline.animate([{ strokeDashoffset: g.perimeter }, { strokeDashoffset: 0 }],
-                               { duration: 450, delay: 850, easing: "ease-out", fill: "both" }),
-          stagePiece.animate([{ opacity: 1 }, { opacity: pieceSlider.value / 100 }],
-                             { duration: 600, delay: 1250, easing: "ease-in-out", fill: "both" }),
-          stageDim.animate([{ opacity: 0.7 }, { opacity: dimSlider.value / 100 }],
-                           { duration: 600, delay: 1250, easing: "ease-in-out", fill: "both" }),
-        ];
-        animations[3].finished.then(() => {
-          stageOutline.style.strokeDashoffset = 0;
-          animations.forEach(a => a.cancel());
-          settleStage();
-        }, () => {});
+      function applySliders() {
+        document.querySelector("#piece-value").textContent = `${pieceSlider.value}%`;
+        document.querySelector("#dim-value").textContent = `${dimSlider.value}%`;
+        stagePiece.style.opacity = pieceSlider.value / 100;
+        stageDim.style.opacity = dimSlider.value / 100;
       }
 
       function showMatch(match, figure) {
@@ -402,24 +372,15 @@
           + (match.matrix ? `${match.points} matching points${match.confirmed ? " (confirmed)" : ""}`
                           : "could not find where the screenshot sits in this frame");
         let pending = 2;
-        const ready = () => { if (--pending === 0) playStage(); };
+        const ready = () => { if (--pending === 0) placeStage(); };
         stageFrame.onload = ready;
         stagePiece.onload = ready;
         stageFrame.src = match.image;
         if (stagePiece.src === uploadUrl && stagePiece.complete) ready(); else stagePiece.src = uploadUrl;
       }
 
-      for (const slider of [pieceSlider, dimSlider]) {
-        slider.addEventListener("input", () => {
-          document.querySelector("#piece-value").textContent = `${pieceSlider.value}%`;
-          document.querySelector("#dim-value").textContent = `${dimSlider.value}%`;
-          if (settled) settleStage();
-        });
-      }
-      document.querySelector("#replay").addEventListener("click", playStage);
-      // Resizing (including a phone's address bar showing or hiding) only
-      // repositions; it never replays the animation.
-      addEventListener("resize", () => { if (settled) placeStage(); });
+      for (const slider of [pieceSlider, dimSlider]) slider.addEventListener("input", applySliders);
+      addEventListener("resize", placeStage);
 
       function renderResults(matches, upload) {
         if (uploadUrl) URL.revokeObjectURL(uploadUrl);
@@ -446,6 +407,7 @@
           results.append(card);
         });
         resultsArea.hidden = false;
+        document.querySelector("#match-view").hidden = !matches.length;
         if (matches.length) showMatch(matches[0], results.firstElementChild);
       }
     </script>
