@@ -1,0 +1,68 @@
+/* Shared light styling for every page: readable type, one column, quiet controls. */
+:root {
+  --text: #1c1c1e;
+  --muted: #6b6b70;
+  --line: #e2e2e6;
+  --surface: #f6f6f8;
+  --accent: #2563eb;
+  --good: #2fbf71;
+  color-scheme: light;
+}
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+body {
+  margin: 0;
+  background: #fff;
+  color: var(--text);
+  font: 15px/1.55 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+.page { max-width: 1240px; margin: 0 auto; padding: 24px 20px 64px; }
+h1 { font-size: 26px; line-height: 1.2; margin: 0 0 6px; letter-spacing: -0.01em; }
+h2 { font-size: 18px; margin: 32px 0 8px; }
+p { margin: 0 0 12px; }
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+img { max-width: 100%; height: auto; }
+hr { border: 0; border-top: 1px solid var(--line); margin: 16px 0; }
+.muted, figcaption { color: var(--muted); }
+.small { font-size: 13px; }
+
+/* Site header: title, then one row of links. */
+.site-head { border-bottom: 1px solid var(--line); padding-bottom: 14px; margin-bottom: 20px; }
+.site-head h1 a { color: inherit; }
+.site-head h1 a:hover { text-decoration: none; }
+.nav { display: flex; flex-wrap: wrap; gap: 4px 18px; margin: 8px 0 0; padding: 0; list-style: none; }
+
+/* Controls */
+button, select {
+  font: inherit;
+  border: 1px solid var(--line);
+  background: #fff;
+  color: var(--text);
+  border-radius: 6px;
+  padding: 6px 12px;
+  cursor: pointer;
+}
+button:hover, select:hover { border-color: #c4c4ca; }
+button:active { background: var(--surface); }
+button:disabled { opacity: 0.5; cursor: default; }
+input[type="file"] { font: inherit; }
+input[type="file"]::file-selector-button {
+  font: inherit; border: 1px solid var(--line); background: #fff;
+  border-radius: 6px; padding: 4px 10px; margin-right: 10px; cursor: pointer;
+}
+input[type="range"] { accent-color: var(--text); }
+progress { accent-color: var(--text); width: 100%; max-width: 420px; }
+
+/* Tables and figures (gallery, benchmarks) */
+table { border-collapse: collapse; font-size: 14px; }
+td, th { border-bottom: 1px solid var(--line); padding: 6px 12px 6px 0; text-align: left; vertical-align: top; }
+th { font-weight: 600; }
+figure { margin: 0; }
+figcaption { font-size: 13px; margin-top: 4px; }
+.grid { display: flex; flex-wrap: wrap; gap: 16px; align-items: flex-start; }
+.grid figure { width: 200px; }
+.gallery figure { width: 320px; }
+.brand { font-weight: 650; font-size: 17px; margin: 0; }
+.brand a { color: inherit; }
+.brand a:hover { text-decoration: none; }

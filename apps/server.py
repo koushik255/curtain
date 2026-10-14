@@ -251,6 +251,20 @@ def security_headers(response):
     return response
 
 
+def page(title: str, body: str, main_class: str = "") -> Response:
+    # Wrap a server-rendered page in the shared header and stylesheet.
+    return Response(
+        '<!doctype html><html lang="en"><head><meta charset="utf-8">'
+        '<meta name="viewport" content="width=device-width,initial-scale=1">'
+        f'<title>{html.escape(title)}</title><link rel="stylesheet" href="/static/site.css"></head>'
+        f'<body><main class="page {main_class}"><header class="site-head"><p class="brand"><a href="/">Curtain Lab</a></p>'
+        '<nav class="nav"><a href="/">Search</a><a href="/gallery">Test images</a>'
+        '<a href="/benchmarks">Benchmarks</a><a href="/movies">Training history</a></nav></header>'
+        f'<h1>{html.escape(title)}</h1>{body}</main></body></html>',
+        mimetype="text/html",
+    )
+
+
 @app.get("/")
 def home():
     # Serve the single-page search interface.
@@ -288,13 +302,11 @@ def movie_catalog():
                 title += ' — indexed separately; not searchable on this site yet'
             items.append(f'<li>{title}</li>')
         sections.append(f'<h2>{html.escape(label)} ({len(rows)})</h2><ul>{"".join(items)}</ul>')
-    return Response('<!doctype html><html lang="en"><head><meta charset="utf-8">'
-        '<meta name="viewport" content="width=device-width,initial-scale=1"><title>Movie training history</title>'
-        '</head><body><h1>Movie training history</h1><p><a href="/">Back to search</a></p>'
-        f'<p>Labels refer to the active combined tile model.</p><p>{html.escape(EXPLANATION)}</p>'
-        '<p>Unseen does not mean unindexed: indexing does not train the model. '
+    return page('Movie training history',
+        f'<p>Labels refer to the active combined tile model.</p><p class="muted">{html.escape(EXPLANATION)}</p>'
+        '<p class="muted">Unseen does not mean unindexed: indexing does not train the model. '
         'Only movies marked searchable now can return matches on this site.</p>'
-        + ''.join(sections) + '</body></html>', mimetype='text/html')
+        + ''.join(sections))
 
 
 @app.post("/api/search-stream")
@@ -372,7 +384,7 @@ def gallery():
     filters = ('<form action="/gallery" method="get"><label for="image-group">Show images from: </label>'
                f'<select id="image-group" name="group">{options}</select> '
                '<button type="submit">Apply</button></form>'
-               '<p>Groups refer to the movie’s training history, not whether each individual frame was used.</p>')
+               '<p class="muted small">Groups refer to the movie’s training history, not whether each individual frame was used.</p>')
     indices = []
     for movie in movie_list:
         count = min(16 if selected else 2, movie["frames"])
@@ -395,18 +407,14 @@ def gallery():
         f'— {html.escape(engine.records[index]["filename"])}</figcaption></figure>'
         for index in indices
     )
-    return Response(
-        "<!doctype html><html lang=en><head><meta charset=utf-8>"
-        '<meta name="viewport" content="width=device-width,initial-scale=1">'
-        "<title>Curtain trained-model test gallery</title></head><body>"
-        '<h1>Curtain trained-model test gallery</h1><p><a href="/">Back to search</a></p>'
-        '<p><a href="/gallery">All movies</a> · <a href="/benchmarks">Benchmarks</a></p>'
-        f'<p><a href="/movies">Movie training history and unseen movie list</a></p><p>{html.escape(EXPLANATION)}</p>'
+    return page(
+        "Test gallery",
+        f'<p class="muted">{html.escape(EXPLANATION)}</p>'
         "<p>Examples from the indexed movies. Save or copy an image to test it on the search page.</p>"
-        f'{filters}<p>{len(movie_list)} movies · {len(indices)} sample images</p>'
+        f'{filters}<p class="muted small">{len(movie_list)} movies · {len(indices)} sample images</p>'
         + ('<p>No images in this group.</p>' if not indices else '') +
-        f"{figures}</body></html>",
-        mimetype="text/html",
+        f'<div class="grid">{figures}</div>',
+        "gallery",
     )
 
 
@@ -416,7 +424,7 @@ def benchmarks():
     # query image beside each system's top match.
     runs = sorted(BENCHMARK_RESULTS.glob("*.json"))
     if not runs:
-        return Response("<p>No benchmark runs yet.</p>", mimetype="text/html")
+        return page("Benchmarks", "<p>No benchmark runs yet.</p>")
     report = json.loads(runs[-1].read_text())
     manifest = json.loads((BENCHMARK_SUITE / "manifest.json").read_text())
     targets = {q["image"]: q["target"] for q in manifest["queries"]}
@@ -482,25 +490,20 @@ def benchmarks():
                         label += f" · {result['points']} matching points"
                     figures.append(frame_figure(result["found"][0], label, BENCHMARK_SUITE / image,
                                                 result.get("matrix")))
-            items.append(f'<div style="display:flex;flex-wrap:wrap;gap:8px;align-items:flex-start">{"".join(figures)}</div><hr>')
+            items.append(f'<div class="grid">{"".join(figures)}</div><hr>')
         sections.append(f'<h2 id="{kind}">{kind}</h2>{"".join(items)}')
 
     movies = ", ".join(m.replace("_", " ") for m in manifest["movies"])
-    return Response(
-        '<!doctype html><html lang="en"><head><meta charset="utf-8">'
-        '<meta name="viewport" content="width=device-width,initial-scale=1"><title>Curtain benchmarks</title>'
-        '<style>table{border-collapse:collapse}td,th{border:1px solid #999;padding:4px 8px;text-align:left}'
-        'figure{margin:0;width:200px}figcaption{font-size:13px}img{max-width:100%;height:auto}</style>'
-        '</head><body><h1>Curtain benchmarks</h1><p><a href="/">Back to search</a></p>'
+    return page(
+        "Benchmarks",
         f'<p>{report["queries"]} test images in {len(types)} types, made only from validation movies '
         f'that no model trained on: {html.escape(movies)}. Each row shows the query, the correct frame, '
         'and every system’s top match.</p>'
-        f'<p>Run {html.escape(runs[-1].stem)} · median search time: {timing}</p>'
+        f'<p class="muted small">Run {html.escape(runs[-1].stem)} · median search time: {timing}</p>'
         f'<table><tr><th>query type</th>{header}</tr>{"".join(summary)}</table>'
-        '<p>✓ exact frame · ≈ same moment (within 1 second) · ~ right movie, wrong moment · ✗ wrong movie. '
+        '<p class="muted small" style="margin-top:12px">✓ exact frame · ≈ same moment (within 1 second) · ~ right movie, wrong moment · ✗ wrong movie. '
         'The green box shows where feature matching placed the query in the site’s top match.</p>'
-        + "".join(sections) + "</body></html>",
-        mimetype="text/html",
+        + "".join(sections),
     )
 
 
