@@ -111,6 +111,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--movies", type=int, default=0, help="upload at most this many movies (0 = all)")
     parser.add_argument("--parallel", type=int, default=3, help="parts uploading at once")
+    parser.add_argument("--only", nargs="+", metavar="MOVIE", help="upload just these movie folders")
     parser.add_argument("--status", action="store_true")
     args = parser.parse_args()
 
@@ -122,6 +123,8 @@ def main() -> None:
     partial = sum(1 for c, d in todo if any(k.startswith(f"{spaces.PREFIX}/{c}/{d.name}/") for k in keys))
     say(f"bucket {spaces.BUCKET} ({spaces.REGION}): {len(stored)}/{len(local)} movies complete, "
         f"{partial} partly uploaded, {sum(keys.values()) / 1e9:.1f} GB stored; {len(todo)} to go")
+    if args.only:
+        todo = [(c, d) for c, d in todo if d.name in args.only]
     if args.status or not todo:
         return
     if args.movies:

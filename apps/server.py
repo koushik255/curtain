@@ -34,6 +34,7 @@ FRAME_ROOTS = {
     "full-curtain": LOCAL_ROOT / "screenshots",
     "l4-50k-lbfive": Path("/home/koushik/lbfive/screenshots"),
 }
+SMALL_FRAMES = LOCAL_ROOT / "frames-small"  # <collection>/<movie>/<frame>.webp
 TIMESTAMP_RECORDS = {
     "full-curtain": LOCAL_ROOT / "trained_indexes/l4-50k-crop-v1",
     "l4-50k-lbfive": LOCAL_ROOT / "trained_indexes/l4-50k-lbfive-crop-v1",
@@ -226,10 +227,13 @@ class TrainedSearchEngine:
         root, folder = self.source_dirs[record.get('source', record['movie'])]
         movie_dir = (root / folder).resolve()
         candidate = (movie_dir / record["filename"]).resolve()
-        if (movie_dir.parent != root or candidate.parent != movie_dir
-                or not candidate.is_file()):
+        if movie_dir.parent != root or candidate.parent != movie_dir:
             return None
-        return candidate
+        if candidate.is_file():
+            return candidate
+        # Pruned to Spaces: a small WebP copy (fetch_small_frames.py), if fetched.
+        small = SMALL_FRAMES / record.get("source", record["movie"]) / (Path(record["filename"]).stem + ".webp")
+        return small if small.is_file() else None
 
 
 app = Flask(__name__)
@@ -338,6 +342,13 @@ def image_size(path: Path) -> tuple[int, int]:
         return image.size
 
 
+MISSING_FRAME = (
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 720"><rect width="1280" height="720" fill="#d9d9d9"/>'
+    '<text x="640" y="370" font-family="sans-serif" font-size="44" fill="#555" text-anchor="middle">'
+    'Frame image not stored on this server</text></svg>'
+)
+
+
 @lru_cache(maxsize=512)
 def thumbnail(path: Path, width: int) -> bytes:
     # Downscaled JPEG of a frame for result cards; recent ones stay in memory.
@@ -356,7 +367,10 @@ def frame_image(index: int):
     # returns a smaller copy.
     path = engine.frame_path(index)
     if path is None:
-        return jsonify(error="Frame not found."), 404
+        if not 0 <= index < len(engine.records):
+            return jsonify(error="Frame not found."), 404
+        # Indexed, but its file only lives in Spaces now (prune_frames.py).
+        return Response(MISSING_FRAME, mimetype="image/svg+xml")
     width = request.args.get("w", type=int)
     if width is None:
         return send_file(path, conditional=True, max_age=0)
@@ -444,7 +458,7 @@ def benchmarks():
         if index is None:
             return f"<figure><p>(frame not in the index)</p><figcaption>{html.escape(caption)}</figcaption></figure>"
         box = ""
-        if matrix and query is not None:
+        if matrix and query is not None and engine.frame_path(index) is not None:
             # Outline where the query sits: its corners mapped into frame pixels.
             fw, fh = image_size(engine.frame_path(index))
             qw, qh = image_size(query)
