@@ -11,6 +11,7 @@ query's score minus WHOLE_HANDICAP (uncropped screenshots match as a whole).
 from __future__ import annotations
 
 import json
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import faiss
@@ -22,6 +23,12 @@ INDEX_NAME = "tiles4-global-ivf16384-pq32.faiss"
 # On the 400-query benchmark, mean-only scoring found 52.5% of full frames and
 # whole-only 13.2% of crops; max(whole - 0.1, mean) keeps 93.5% and 48.0%.
 WHOLE_HANDICAP = 0.1
+READ_THREADS = 8
+# FAISS candidates per query image, re-scored exactly. On the 502-movie index's
+# validation suite 128 matched 256 (70 vs 71 exact, 80 vs 78 same moment, 91
+# right movie both) with half the frames to read.
+CANDIDATES = 128
+READERS = ThreadPoolExecutor(READ_THREADS)
 
 
 def pieces(image: Image.Image) -> list[Image.Image]:
@@ -47,20 +54,24 @@ def load(directory: Path = FAISS_DIR, nprobe: int = 64) -> dict:
 
 
 def frame_vectors(engine: dict, frames: np.ndarray) -> np.ndarray:
-    """[len(frames), 50, 128] float32: 49 tiles then the whole frame."""
+    """[len(frames), 50, 128] float32: 49 tiles then the whole frame.
+
+    The arrays (~90 GB) don't fit in RAM, so most rows are page faults on the
+    NVMe; READERS threads fault in parallel (4x faster than one at a time)."""
     movie = np.searchsorted(engine["firsts"], frames, side="right") - 1
     rows = frames - engine["firsts"][movie]
     out = np.empty((len(frames), 50, 128), dtype=np.float32)
-    for m in np.unique(movie):
-        pick = np.where(movie == m)[0]
-        order = np.argsort(rows[pick])  # sorted reads from the mmap
-        r = rows[pick][order]
-        out[pick[order], :49] = engine["tiles"][m][r]
-        out[pick[order], 49] = engine["whole"][m][r]
+
+    def read(chunk: np.ndarray) -> None:
+        for m in np.unique(movie[chunk]):
+            pick = chunk[movie[chunk] == m]  # rows ascending: sorted reads from the mmap
+            out[pick, :49] = engine["tiles"][m][rows[pick]]
+            out[pick, 49] = engine["whole"][m][rows[pick]]
+    list(READERS.map(read, np.array_split(np.lexsort((rows, movie)), READ_THREADS)))
     return out
 
 
-def search(engine: dict, queries: np.ndarray, candidates: int = 256, top: int = 5) -> list[tuple[int, float]]:
+def search(engine: dict, queries: np.ndarray, candidates: int = CANDIDATES, top: int = 5) -> list[tuple[int, float]]:
     """queries: [q, 128] unit vectors for one search, the whole query image
     first, then its pieces. Returns [(frame id, score)] best first."""
     queries = np.ascontiguousarray(queries, dtype=np.float32)
