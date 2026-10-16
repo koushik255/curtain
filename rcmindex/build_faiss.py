@@ -42,6 +42,29 @@ def vectors(tiles: np.ndarray, whole: np.ndarray, first: int, rows: np.ndarray) 
     return np.concatenate([t.reshape(r * views, dim), np.asarray(whole[rows], dtype=np.float32)]), ids
 
 
+def one_per_film(entries: list) -> list:
+    """Some films sit in both collections under slightly different names
+    ("Anatomy_Of_A_Murder_1959" / "Anatomy_of_a_Murder_1959"); index one copy,
+    or they fill each other's result slots. full-curtain wins (the validation
+    suite names it) unless the other copy is a 5%+ longer cut."""
+    films: dict[str, list] = {}
+    for movie, files, records in entries:
+        key = "".join(ch for ch in movie.split("/")[1].lower() if ch.isalnum())
+        films.setdefault(key, []).append((movie, files, records, len(np.load(files["4"], mmap_mode="r"))))
+    kept = []
+    for copies in films.values():
+        copies.sort(key=lambda c: (not c[0].startswith("full-curtain/"), c[0]))
+        best = copies[0]
+        for other in copies[1:]:
+            if other[3] >= best[3] * 1.05:
+                best = other
+        for other in copies:
+            if other is not best:
+                note(f"duplicate film: keeping {best[0]} ({best[3]:,} frames), dropping {other[0]} ({other[3]:,})")
+        kept.append(best)
+    return sorted(kept)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--lists", type=int, default=16384)
@@ -52,8 +75,7 @@ def main() -> None:
     OUT.mkdir(parents=True, exist_ok=True)
 
     movies, names, first = [], [], 0
-    for movie, files, records in index_files():
-        count = len(np.load(files["4"], mmap_mode="r"))
+    for movie, files, records, count in one_per_film(index_files()):
         collection = movie.split("/")[0]
         names += [f"{collection}/{r}" for r in json.loads(records.read_text())]
         movies.append({"movie": movie, "first": first, "frames": count,
