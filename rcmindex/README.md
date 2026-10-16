@@ -44,14 +44,25 @@ validate retrieval on the 75k benchmark before a full run.
 ## 2. Put the frames in Spaces (once, in the background)
 
 ```sh
-python3 rcmindex/droplet/upload_frames.py            # all 157 movies, ~114 GB, resumable
+python3 rcmindex/droplet/upload_frames.py            # every local movie not stored yet, resumable
 python3 rcmindex/droplet/upload_frames.py --status
+python3 rcmindex/droplet/upload_frames.py --only Heat_1995   # just these folders
 ```
 
 Streams each local movie folder (`.local/screenshots`, `~/lbfive/screenshots`)
-as a tar into the private bucket `curtain-frames-koushik` (tor1), 2 at a time,
+as ~100 MB tar parts into the private bucket `curtain-frames-koushik` (tor1),
 with progress and ETA. Stop it any time; a rerun skips stored movies. The
 Spaces key is in `~/.config/curtain/spaces.env` and never leaves this machine.
+
+Stored movies can then leave the local disk; the site keeps small copies:
+
+```sh
+python3 rcmindex/droplet/prune_frames.py --delete    # verify each Spaces copy, then delete local JPEGs
+python3 rcmindex/droplet/fetch_small_frames.py       # 640 px WebP copies into .local/frames-small/
+```
+
+`prune_frames.py` keeps the validation movies and every frame the gallery and
+benchmark pages show.
 
 ## 3. Run on a GPU droplet (one command, from this machine)
 
