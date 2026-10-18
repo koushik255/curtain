@@ -356,6 +356,11 @@ def search_stream():
         try:
             for event in engine.search_stream(data):
                 yield json.dumps(event, separators=(",", ":")) + "\n"
+        except Image.DecompressionBombError:
+            # Pillow refuses images over 2 x MAX_IMAGE_PIXELS (~179 MP) to protect memory.
+            yield json.dumps({"type": "error", "error": "That image has too many pixels to search "
+                              f"(the limit is about {2 * Image.MAX_IMAGE_PIXELS // 1_000_000} megapixels). "
+                              "Please upload a smaller copy or a screenshot."}) + "\n"
         except (UnidentifiedImageError, OSError, ValueError):
             yield json.dumps({"type": "error", "error": "That file is not a readable image."}) + "\n"
 

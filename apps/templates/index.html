@@ -191,19 +191,46 @@
       // JPEG carries all it needs. Shrinking happens when the image is chosen,
       // before "Find the frame", so only the upload and search are timed.
       const UPLOAD_SIDE = 640;
+      // The server refuses request bodies over 20 MB (MAX_CONTENT_LENGTH).
+      const MAX_UPLOAD = 20 * 1024 * 1024;
+      const TOO_LARGE = "That image is too large to upload (the limit is 20 MB) and this browser could not shrink it. "
+        + "Try a PNG, JPEG or WebP screenshot, or export a smaller copy.";
       let preparedUpload = null;
+
+      // Decode the file into something drawable. createImageBitmap first; if
+      // that fails (very large dimensions, or formats only <img> understands,
+      // such as HEIC in Safari), try a downscaled bitmap, then an <img>.
+      async function decodeImage(file) {
+        try {
+          return await createImageBitmap(file, { imageOrientation: "from-image" });
+        } catch {}
+        try {
+          return await createImageBitmap(file, { imageOrientation: "from-image", resizeWidth: UPLOAD_SIDE * 2, resizeQuality: "high" });
+        } catch {}
+        const url = URL.createObjectURL(file);
+        try {
+          const image = new Image();
+          image.src = url;
+          await image.decode();
+          return image;
+        } finally {
+          URL.revokeObjectURL(url);
+        }
+      }
 
       async function prepareUpload(file) {
         try {
-          const bitmap = await createImageBitmap(file, { imageOrientation: "from-image" });
-          const scale = Math.min(1, UPLOAD_SIDE / Math.max(bitmap.width, bitmap.height));
+          const source = await decodeImage(file);
+          const width = source.naturalWidth || source.width, height = source.naturalHeight || source.height;
+          const scale = Math.min(1, UPLOAD_SIDE / Math.max(width, height));
           const canvas = document.createElement("canvas");
-          canvas.width = Math.round(bitmap.width * scale);
-          canvas.height = Math.round(bitmap.height * scale);
-          canvas.getContext("2d").drawImage(bitmap, 0, 0, canvas.width, canvas.height);
-          bitmap.close();
+          canvas.width = Math.max(1, Math.round(width * scale));
+          canvas.height = Math.max(1, Math.round(height * scale));
+          canvas.getContext("2d").drawImage(source, 0, 0, canvas.width, canvas.height);
+          if (source.close) source.close();
           const blob = await new Promise(resolve => canvas.toBlob(resolve, "image/jpeg", 0.9));
-          return blob && blob.size < file.size ? blob : file;
+          // Keep the original only when it is already smaller than the re-encode.
+          return blob && (blob.size < file.size || file.size > MAX_UPLOAD) ? blob : file;
         } catch {
           return file;  // send the original if the browser cannot decode it here
         }
@@ -223,7 +250,9 @@
         status.textContent = `Preparing ${name}…`;
         preparedUpload = prepareUpload(file).then(blob => {
           if (selectedFile === file) {
-            status.textContent = blob === file
+            status.textContent = blob.size > MAX_UPLOAD
+              ? TOO_LARGE
+              : blob === file
               ? `${name} is ready.`
               : `${name} is ready (${kilobytes(file.size)} → ${kilobytes(blob.size)} to upload).`;
           }
@@ -270,6 +299,12 @@
         button.disabled = true;
         button.textContent = "Searching…";
         const upload = await preparedUpload;  // normally finished long before the click
+        if (upload.size > MAX_UPLOAD) {
+          status.textContent = TOO_LARGE;
+          button.disabled = false;
+          button.textContent = "Find the frame";
+          return;
+        }
         status.textContent = "Sending the query image…";
         timings.textContent = "";
         resultsArea.hidden = true;
@@ -282,28 +317,42 @@
         const timer = setInterval(() => {
           trackerTime.textContent = `${Math.round(performance.now() - started)} ms elapsed`;
         }, 50);
+        let reached = false;
         try {
           const response = await fetch("/api/search-stream", {
             method: "POST",
             headers: { "Content-Type": upload.type || "application/octet-stream" },
             body: upload,
           });
-          if (!response.ok || !response.body) throw new Error("Search failed.");
+          reached = true;
+          if (!response.ok || !response.body) throw new Error(await failureMessage(response));
           const reader = response.body.getReader();
           const decoder = new TextDecoder();
           let buffer = "";
+          let finished = false;
           while (true) {
             const {value, done} = await reader.read();
             buffer += decoder.decode(value || new Uint8Array(), {stream: !done});
             const lines = buffer.split("\n");
             buffer = lines.pop();
             for (const line of lines) {
-              if (line) handleSearchEvent(JSON.parse(line), started, upload);
+              if (!line) continue;
+              let event;
+              try {
+                event = JSON.parse(line);
+              } catch {
+                throw new Error("Search failed: the server sent an unexpected response. Please try again.");
+              }
+              handleSearchEvent(event, started, upload);
+              finished ||= event.type === "result";
             }
             if (done) break;
           }
+          if (!finished) throw new Error("The search stopped before any results arrived. Please try again.");
         } catch (error) {
-          status.textContent = error.message || "Search failed.";
+          status.textContent = !reached && error instanceof TypeError
+            ? "Could not reach the server. Check your connection and try again."
+            : error.message || "Search failed.";
         } finally {
           clearInterval(timer);
           trackerTime.textContent = `${Math.round(performance.now() - started)} ms elapsed`;
@@ -311,6 +360,19 @@
           button.textContent = "Find the frame";
         }
       });
+
+      // A readable reason for a non-OK response: the server's JSON error when
+      // there is one (Flask sends {"error": ...}), otherwise one by status.
+      async function failureMessage(response) {
+        if (response.status === 413) return "That image is too large to upload (the limit is 20 MB). Try a smaller copy or a screenshot.";
+        try {
+          const data = await response.json();
+          if (data && typeof data.error === "string") return data.error;
+        } catch {}
+        if (response.status === 429) return "Too many searches right now. Please wait a moment and try again.";
+        if (response.status >= 500) return `The search server had a problem (HTTP ${response.status}). Please try again shortly.`;
+        return `Search failed (HTTP ${response.status}).`;
+      }
 
       function handleSearchEvent(event, browserStarted, upload) {
         if (event.type === "error") throw new Error(event.error);
