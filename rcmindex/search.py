@@ -11,6 +11,8 @@ query's score minus WHOLE_HANDICAP (uncropped screenshots match as a whole).
 from __future__ import annotations
 
 import json
+import operator
+from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -19,7 +21,12 @@ import numpy as np
 from PIL import Image
 
 FAISS_DIR = Path(__file__).resolve().parents[1] / ".local/faiss"
-INDEX_NAME = "tiles4-global-ivf16384-pq32.faiss"
+# On-disk copy of tiles4-global-ivf16384-pq32.faiss (rcmindex/ondisk_faiss.py):
+# its inverted lists (~14 GB of PQ codes and ids) live in the .ivfdata file
+# beside it and are memory-mapped, so they sit in the page cache, not the heap.
+# Opened with IO_FLAG_READ_ONLY (the .ivfdata is mapped read-only either way);
+# IO_FLAG_MMAP on this format segfaults on search with faiss 1.15.1.
+INDEX_NAME = "tiles4-global-ivf16384-pq32.ondisk.faiss"
 # On the 400-query benchmark, mean-only scoring found 52.5% of full frames and
 # whole-only 13.2% of crops; max(whole - 0.1, mean) keeps 93.5% and 48.0%.
 WHOLE_HANDICAP = 0.1
@@ -38,14 +45,71 @@ def pieces(image: Image.Image) -> list[Image.Image]:
     return [image.crop((x, y, x + pw, y + ph)) for y in (0, h - ph) for x in (0, w - pw)]
 
 
+class FrameNames(Sequence):
+    """catalog.json "names" ("<collection>/<movie>/<frame>.jpg" in frame-id
+    order), stored as one fixed-width bytes array of frame filenames plus the
+    per-movie spans; 7M separate Python strings took about 1 GB."""
+
+    def __init__(self, movies: list[dict], names: list[str]):
+        self.movies = [m["movie"] for m in movies]
+        self.firsts = np.array([m["first"] for m in movies], dtype=np.int64)
+        files = []
+        for m in movies:
+            if m["first"] != len(files):
+                raise RuntimeError("Catalog frame ids are not contiguous.")
+            prefix = m["movie"] + "/"
+            for name in names[m["first"]:m["first"] + m["frames"]]:
+                if not name.startswith(prefix) or "/" in name[len(prefix):]:
+                    raise RuntimeError(f"Invalid frame name {name}.")
+                files.append(name[len(prefix):].encode())
+        if len(files) != len(names):
+            raise RuntimeError("Catalog names and movies disagree.")
+        self.files = np.array(files, dtype=np.bytes_)  # sorted within each movie
+
+    def __len__(self) -> int:
+        return len(self.files)
+
+    def row(self, index: int) -> int:
+        row = operator.index(index)
+        if row < 0:
+            row += len(self.files)
+        if not 0 <= row < len(self.files):
+            raise IndexError("frame id out of range")
+        return row
+
+    def movie_of(self, index: int) -> int:
+        """Position in catalog["movies"] of the movie holding this frame."""
+        return int(np.searchsorted(self.firsts, self.row(index), side="right")) - 1
+
+    def filename(self, index: int) -> str:
+        return self.files[self.row(index)].decode()
+
+    def find(self, start: int, count: int, filename: str) -> int | None:
+        """Frame id of filename within the span [start, start + count), if present."""
+        try:
+            key = filename.encode()
+        except UnicodeEncodeError:
+            return None
+        if not key or len(key) > self.files.itemsize or key.endswith(b"\0"):
+            return None
+        span = self.files[start:start + count]
+        row = int(np.searchsorted(span, key))
+        return start + row if row < len(span) and span[row] == key else None
+
+    def __getitem__(self, index: int) -> str:
+        return f"{self.movies[self.movie_of(index)]}/{self.filename(index)}"
+
+
 def load(directory: Path = FAISS_DIR, nprobe: int = 64) -> dict:
     catalog = json.loads((directory / "catalog.json").read_text())
-    index = faiss.read_index(str(directory / INDEX_NAME))
+    index = faiss.read_index(str(directory / INDEX_NAME), faiss.IO_FLAG_READ_ONLY)
     faiss.extract_index_ivf(index).nprobe = nprobe
     movies = catalog["movies"]
+    names = FrameNames(movies, catalog.pop("names"))
     return {
         "index": index,
-        "names": catalog["names"],
+        "names": names,
+        "movies": movies,
         "stride": catalog["id_stride"],
         "firsts": np.array([m["first"] for m in movies]),
         "tiles": [np.load(m["tiles"], mmap_mode="r") for m in movies],

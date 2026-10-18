@@ -5,12 +5,13 @@ import hashlib
 import html
 import io
 import json
+import math
+import operator
 import time
-from bisect import bisect_left
 from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
 from pathlib import Path
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 
 import numpy as np
 import torch
@@ -52,6 +53,39 @@ BENCHMARK_SUITE = LOCAL_ROOT / "benchmarks/validation-v1"
 BENCHMARK_RESULTS = LOCAL_ROOT / "benchmarks/results"
 
 
+class FrameRecords(Sequence):
+    """Per-frame records, built on demand from compact arrays instead of 7M
+    stored dicts: {"movie", "source", "filename", "frame_number",
+    "timestamp_seconds"} for each frame id."""
+
+    def __init__(self, names: tile_search.FrameNames, entries: list[tuple[str, str]],
+                 timestamps: np.ndarray, other_timestamps: dict[int, object]):
+        self.names = names              # frame filenames and movie spans
+        self.entries = entries          # (movie id, source) per catalog movie
+        self.timestamps = timestamps    # float64 seconds, NaN where unknown
+        self.other_timestamps = other_timestamps  # rare values a float can't hold
+
+    def __len__(self) -> int:
+        return len(self.names)
+
+    def __getitem__(self, index: int) -> dict:
+        row = self.names.row(index)
+        movie, source = self.entries[self.names.movie_of(row)]
+        filename = self.names.filename(row)
+        seconds = self.timestamps[row]
+        if row in self.other_timestamps:
+            timestamp = self.other_timestamps[row]
+        else:
+            timestamp = None if math.isnan(seconds) else float(seconds)
+        return {
+            "movie": movie,
+            "source": source,
+            "filename": filename,
+            "frame_number": int(Path(filename).stem.rsplit("_", 1)[1]),
+            "timestamp_seconds": timestamp,
+        }
+
+
 class TrainedSearchEngine:
     def __init__(self, checkpoint: Path):
         # Load the model, the FAISS tile index and per-frame records.
@@ -63,21 +97,20 @@ class TrainedSearchEngine:
         split = load_split(checkpoint, checkpoint_hash, PROJECT_ROOT)
         self.search_index = tile_search.load()
 
-        self.records = []
         self.movies = []
         self.movie_lookup = {}
         self.source_dirs = {}
         self.source_spans = {}
         known = {}
-        catalog = json.loads((tile_search.FAISS_DIR / "catalog.json").read_text())
-        names = catalog["names"]  # "<collection>/<movie>/<frame>.jpg" in frame-id order
-        for entry in catalog["movies"]:
+        names = self.search_index["names"]  # compact "<collection>/<movie>/<frame>.jpg" by frame id
+        entries = []
+        frame_timestamps = np.full(len(names), np.nan)
+        other_timestamps = {}
+        for entry in self.search_index["movies"]:
             collection, name = entry["movie"].split("/")
             if Path(name).name != name or collection not in FRAME_ROOTS:
                 raise RuntimeError(f"Invalid movie entry {entry['movie']}.")
             start, count = entry["first"], entry["frames"]
-            if start != len(self.records):
-                raise RuntimeError("Catalog frame ids are not contiguous.")
             source = entry["movie"]
             self.source_dirs[source] = (FRAME_ROOTS[collection].resolve(), name)
             self.source_spans[source] = (start, count)
@@ -107,17 +140,15 @@ class TrainedSearchEngine:
                 self.movie_lookup[name] = movie
             movie["spans"].append((start, count))
             movie["frames"] += count
-            for full in names[start:start + count]:
-                filename = full.rsplit("/", 1)[1]
-                if Path(filename).name != filename:
-                    raise RuntimeError(f"Invalid frame name {full}.")
-                self.records.append({
-                    "movie": movie["id"],
-                    "source": source,
-                    "filename": filename,
-                    "frame_number": int(Path(filename).stem.rsplit("_", 1)[1]),
-                    "timestamp_seconds": timestamps.get(filename),
-                })
+            entries.append((movie["id"], source))
+            if timestamps:
+                for row in range(start, start + count):
+                    seconds = timestamps.get(names.filename(row))
+                    if type(seconds) is float and not math.isnan(seconds):
+                        frame_timestamps[row] = seconds
+                    elif seconds is not None:
+                        other_timestamps[row] = seconds
+        self.records = FrameRecords(names, entries, frame_timestamps, other_timestamps)
         if not self.records:
             raise RuntimeError("No frames loaded.")
         self.vectors = self.search_index["index"].ntotal
@@ -216,8 +247,7 @@ class TrainedSearchEngine:
         if source not in self.source_spans:
             return None
         start, count = self.source_spans[source]
-        row = bisect_left(self.records, filename, start, start + count, key=lambda r: r["filename"])
-        return row if row < start + count and self.records[row]["filename"] == filename else None
+        return self.search_index["names"].find(start, count, filename)
 
     def frame_path(self, index: int) -> Path | None:
         # Resolve a safe local source path for an indexed frame row.
