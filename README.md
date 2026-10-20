@@ -74,9 +74,7 @@ with greyscale and stronger colour changes is the next step.
 
 ```text
 curtain_ml/          Encoder, training and retrieval logic
-cloud/               Modal training and indexing jobs
 rcmindex/            C++/HIP tile indexer for AMD GPUs, FAISS search, alignment
-  droplet/           Spaces upload, GPU droplet launcher, frame pruning
 apps/                Search site
 benchmarks/          Retrieval robustness checks against the live index
 deploy/              systemd unit for the site
@@ -85,30 +83,21 @@ docs/                Training notes and README images
 
 ### Train and index
 
-Training and indexing run on GPU hosts. The current model comes from the ROCm
-trainer ([docs/rocm-training.md](docs/rocm-training.md)). Frames go to
-DigitalOcean Spaces, and `rcmindex` indexes them on an AMD GPU droplet that is
-created, used and deleted by one command from this machine
-([rcmindex/README.md](rcmindex/README.md)):
+Training and indexing need a ROCm or CUDA GPU. The current model comes from
+the ROCm trainer ([docs/rocm-training.md](docs/rocm-training.md)), and
+`rcmindex` computes the tile embeddings ([rcmindex/README.md](rcmindex/README.md)):
 
 ```sh
-python3 rcmindex/droplet/upload_frames.py          # frames -> Spaces, resumable
-python3 rcmindex/droplet/launch.py --movies 0      # index every new movie on an MI325X
-.venv/bin/python -m rcmindex.build_faiss           # one FAISS index, one copy per film
+rcmindex/build/rcmindex --model DIR --movies-from - --output DIR   # tile embeddings, movie dirs on stdin
+.venv/bin/python -m rcmindex.build_faiss                           # one FAISS index, one copy per film
 ```
 
-Once a movie is safely in Spaces, `prune_frames.py` deletes its local JPEGs
-(after checking the stored copy) and `fetch_small_frames.py` brings back
-640 px WebP copies for the site, about 30% of the size. On the benchmark,
-alignment against them matched the originals (75 vs 76 exact).
+All frames are kept on this machine only. Apart from the six validation
+movies, indexed movies are stored as 640 px WebP copies, about 30% of the
+size of the originals. On the benchmark, alignment against them matched the
+originals (75 vs 76 exact).
 
-The original Modal jobs (whole-frame embeddings) are still here; see
-[docs/training.md](docs/training.md):
-
-```sh
-.venv/bin/modal run cloud/train.py --epochs 20 --run-name my-run
-.venv/bin/modal run cloud/index.py
-```
+The original whole-frame trainer is described in [docs/training.md](docs/training.md).
 
 ### Search site
 
@@ -129,7 +118,7 @@ Large inputs live in the ignored `.local/` directory:
 ```text
 .local/
   screenshots/             Source frames
-  frames-small/            640 px WebP copies of frames pruned to Spaces
+  frames-small/            640 px WebP copies (the only copy of most movies' frames)
   selected_screenshots*/   Training selections
   trained_models/          Checkpoints and experiment reports
   trained_indexes/         Older whole-frame embeddings

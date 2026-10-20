@@ -261,7 +261,7 @@ class TrainedSearchEngine:
             return None
         if candidate.is_file():
             return candidate
-        # Pruned to Spaces: a small WebP copy (fetch_small_frames.py), if fetched.
+        # Original pruned: its 640 px WebP copy in .local/frames-small/.
         small = SMALL_FRAMES / record.get("source", record["movie"]) / (Path(record["filename"]).stem + ".webp")
         return small if small.is_file() else None
 
@@ -404,7 +404,7 @@ def frame_image(index: int):
     if path is None:
         if not 0 <= index < len(engine.records):
             return jsonify(error="Frame not found."), 404
-        # Indexed, but its file only lives in Spaces now (prune_frames.py).
+        # Indexed, but neither the original nor its WebP copy is on disk.
         return Response(MISSING_FRAME, mimetype="image/svg+xml")
     width = request.args.get("w", type=int)
     if width is None:

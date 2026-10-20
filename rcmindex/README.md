@@ -1,6 +1,6 @@
 # rcmindex
 
-C++/HIP overlapping-tile indexer for the ROCm (MI300X/MI325X) GPU droplet.
+C++/HIP overlapping-tile indexer for ROCm GPUs (built for MI300X/MI325X).
 It writes the same layout as the 75k Python indexer: `OUT.npy` (fp16
 `[frames, 49, 128]`), `OUT.records.json` and `OUT.json` (timing report).
 
@@ -41,47 +41,21 @@ Add `--check frame1.jpg frame2.jpg ...` to compare shared-trunk tiles with the
 current per-tile embeddings on CPU. On 20 frames: mean cosine 0.91, p5 0.85, so
 validate retrieval on the 75k benchmark before a full run.
 
-## 2. Put the frames in Spaces (once, in the background)
+## 2. Compute the tile embeddings
+
+Build on a machine with ROCm and MIGraphX (`migraphx-dev`, `libturbojpeg0-dev`,
+`cmake`), then feed it movie folders:
 
 ```sh
-python3 rcmindex/droplet/upload_frames.py            # every local movie not stored yet, resumable
-python3 rcmindex/droplet/upload_frames.py --status
-python3 rcmindex/droplet/upload_frames.py --only Heat_1995   # just these folders
+cmake -S rcmindex -B rcmindex/build -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH=/opt/rocm
+cmake --build rcmindex/build -j"$(nproc)"
+# Each movie's parent folder name becomes its collection: <output>/<collection>/<movie>.npy
+mkdir -p .local/index-input/full-curtain
+ln -s "$PWD/.local/screenshots/New_Movie_2024" .local/index-input/full-curtain/
+ls -d .local/index-input/*/* | rcmindex/build/rcmindex \
+  --model .local/rcmindex-model/combined-rocm-50k-v1 --movies-from - --global \
+  --output .local/rcmindex-runs/$(date +%Y%m%d-%H%M%S)
 ```
-
-Streams each local movie folder (`.local/screenshots`, `~/lbfive/screenshots`)
-as ~100 MB tar parts into the private bucket `curtain-frames-koushik` (tor1),
-with progress and ETA. Stop it any time; a rerun skips stored movies. The
-Spaces key is in `~/.config/curtain/spaces.env` and never leaves this machine.
-
-Stored movies can then leave the local disk; the site keeps small copies:
-
-```sh
-python3 rcmindex/droplet/prune_frames.py --delete    # verify each Spaces copy, then delete local JPEGs
-python3 rcmindex/droplet/fetch_small_frames.py       # 640 px WebP copies into .local/frames-small/
-```
-
-`prune_frames.py` keeps the validation movies and every frame the gallery and
-benchmark pages show.
-
-## 3. Run on a GPU droplet (one command, from this machine)
-
-```sh
-python3 rcmindex/droplet/launch.py                   # 5 random movies from Spaces
-python3 rcmindex/droplet/launch.py --movies 0        # every stored movie
-python3 rcmindex/droplet/launch.py --source local --movies 2   # upload from here instead
-python3 rcmindex/droplet/launch.py --keep / --destroy
-```
-
-It creates an MI325X (trying regions, then MI300X), copies `rcmindex/` and the
-exported model, and starts the transfer as soon as ssh works, while the
-droplet is still installing and building. From Spaces, the droplet downloads
-8 movies at a time through presigned links (no key on the droplet); with
-`--source local`, movies stream over `tar | ssh`. Each movie is marked
-complete when it has arrived and `droplet/run_index.py` hands it to the
-already-running `rcmindex` immediately. Transfer and GPU progress print in the
-same terminal. Results are copied to `.local/rcmindex-runs/<time>/`, then the
-droplet is deleted (also on failure or Ctrl-C).
 
 Output per movie: `<collection>/<movie>.npy` (`[frames, 49, 128]` fp16),
 `.global.npy`, `.records.json`, `.json` timing report.
@@ -94,7 +68,7 @@ rcmindex --model DIR --movies-from - --output DIR      # movie dirs read from st
          [--grids 4,3,2,1] [--global] [--batch 32] [--slots 3] [--readers 16] [--limit N]
 ```
 
-## 4. Build the search index
+## 3. Build the search index
 
 ```sh
 .venv/bin/python -m rcmindex.build_faiss

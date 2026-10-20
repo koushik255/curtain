@@ -16,18 +16,18 @@ For each training frame:
 5. Validation measures exact-frame and movie top-1 retrieval after each epoch.
 6. `best.pt` is saved whenever exact-frame validation accuracy improves.
 
-The trainer is CUDA-only. Modal extracts the existing 50,000-frame archive to
-temporary local storage and persists the checkpoint under `/data/runs/<run>`:
+The trainer needs a CUDA or ROCm GPU. It reads one folder per movie and writes
+the checkpoint to the output directory:
 
 ```sh
-.venv/bin/modal run cloud/train.py \
-  --epochs 20 \
-  --run-name l4-50k-crop-v2
+.venv/bin/python -m curtain_ml.training \
+  --data .local/selected_screenshots \
+  --output .local/trained_models/l4-50k-crop-v2 \
+  --epochs 20
 ```
 
-The defaults—batch size 128, 192-pixel inputs, six validation movies, and eight
-loader workers—live in `TrainingConfig` rather than being repeated throughout
-the command line and Modal wrapper.
+The defaults (192-pixel inputs, six validation movies, eight loader workers)
+live in `TrainingConfig` rather than on the command line.
 
 ## Indexing
 
@@ -35,30 +35,10 @@ Training on 50,000 representative frames and indexing 2.48 million frames are
 separate jobs. Indexing never modifies the model; it runs every searchable frame
 through the frozen checkpoint once.
 
-`cloud/index.py` prepares one task per movie and maps those tasks across at most
-two L4 containers. Each container:
-
-1. Loads and verifies the pinned checkpoint once.
-2. Extracts one existing movie archive to temporary local disk.
-3. Uses eight CPU workers only to read compressed JPEG bytes.
-4. Uses nvJPEG on CUDA to decode them, then resizes and normalizes on the GPU.
-5. Encodes batches of 512 and writes a preallocated float16 matrix.
-6. Commits the movie index to the Modal Volume.
-
-The two workers receive tasks from Modal's map queue, so a movie is handled by
-exactly one worker. Completed, matching indexes are skipped on reruns.
-
-Inspect the task list without renting a GPU:
-
-```sh
-.venv/bin/modal run cloud/index.py --dry-run
-```
-
-Run all movies and download both verified collections:
-
-```sh
-.venv/bin/modal run cloud/index.py
-```
+These whole-frame indexes were built with `curtain_ml/index.py`
+(`CudaIndexer`: CPU workers read JPEG bytes, nvJPEG decodes on the GPU, batches
+of 512 are encoded into a preallocated float16 matrix). The tile indexer
+[rcmindex](../rcmindex/README.md) has since replaced it.
 
 The active local outputs are:
 
@@ -82,8 +62,8 @@ normalized matrices in memory. For a query it:
 3. Multiplies chunks of the frame matrix by that embedding.
 4. Streams progress and returns the highest cosine similarity.
 
-The live site uses CPU inference because it is a persistent local service; the
-large one-time training and indexing workloads use Modal CUDA GPUs.
+The live site uses CPU inference because it is a persistent local service;
+training and indexing need a GPU.
 
 Run the one retained robustness benchmark against the live artifacts with:
 

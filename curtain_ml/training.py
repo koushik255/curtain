@@ -26,7 +26,7 @@ IMAGENET_STD = (0.229, 0.224, 0.225)
 
 @dataclass(frozen=True)
 class TrainingConfig:
-    """Parameters shared by local and Modal contrastive-training runs."""
+    """Parameters for contrastive-training runs."""
     data_dir: str
     output_dir: str
     epochs: int = 20
@@ -326,7 +326,7 @@ def seed_everything(seed: int) -> None:
 
 
 def train(config: TrainingConfig) -> dict[str, float]:
-    # Train the encoder on Modal's CUDA device and save the best checkpoint.
+    # Train the encoder on a CUDA (or ROCm) device and save the best checkpoint.
     seed_everything(config.seed)
     data_dir = Path(config.data_dir).expanduser().resolve()
     output_dir = Path(config.output_dir).expanduser().resolve()
