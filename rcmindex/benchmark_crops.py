@@ -44,12 +44,12 @@ TOP = 5
 PIECES = 4
 
 
-def index_files() -> list[tuple[str, dict[str, Path], Path]]:
+def index_files(runs: Path = RUNS) -> list[tuple[str, dict[str, Path], Path]]:
     """Per movie: ("<collection>/<movie>", {grid: newest .npy}, records path).
     Some titles exist in both collections, so the collection is part of the key."""
     found: dict[str, dict[str, Path]] = {}
     records: dict[str, Path] = {}
-    for path in sorted(RUNS.glob("*/*/*.npy")):  # run dirs sort by time, newest last
+    for path in sorted(runs.glob("*/*/*.npy")):  # run dirs sort by time, newest last
         # Longest suffix first: titles can contain dots ("Mr._Smith...").
         grid = next((g for g, suffix in sorted(GRIDS.items(), key=lambda kv: -len(kv[1]))
                      if path.name.endswith(suffix)), None)

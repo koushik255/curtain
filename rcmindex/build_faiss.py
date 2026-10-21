@@ -22,7 +22,7 @@ from pathlib import Path
 import faiss
 import numpy as np
 
-from rcmindex.benchmark_crops import index_files
+from rcmindex.benchmark_crops import RUNS, index_files
 
 OUT = Path(__file__).resolve().parents[1] / ".local/faiss"
 GLOBAL_VIEW = 63
@@ -70,12 +70,17 @@ def main() -> None:
     parser.add_argument("--lists", type=int, default=16384)
     parser.add_argument("--pq", type=int, default=32, help="bytes per vector")
     parser.add_argument("--train-frames", type=int, default=30_000)
+    # Another model's arrays and index go in their own folders, so the site's
+    # .local/faiss and the old arrays stay untouched until it switches.
+    parser.add_argument("--runs", type=Path, default=RUNS, help="rcmindex run directories to index")
+    parser.add_argument("--out", type=Path, default=OUT, help="where catalog.json and the index go")
     args = parser.parse_args()
+    out = args.out
     faiss.omp_set_num_threads(16)
-    OUT.mkdir(parents=True, exist_ok=True)
+    out.mkdir(parents=True, exist_ok=True)
 
     movies, names, first = [], [], 0
-    for movie, files, records, count in one_per_film(index_files()):
+    for movie, files, records, count in one_per_film(index_files(args.runs)):
         collection = movie.split("/")[0]
         names += [f"{collection}/{r}" for r in json.loads(records.read_text())]
         movies.append({"movie": movie, "first": first, "frames": count,
@@ -83,7 +88,7 @@ def main() -> None:
         first += count
     total = first * 50
     note(f"{len(movies)} movies, {first:,} frames, {total:,} vectors")
-    (OUT / "catalog.json").write_text(json.dumps({"movies": movies, "names": names, "views": 49,
+    (out / "catalog.json").write_text(json.dumps({"movies": movies, "names": names, "views": 49,
                                                   "global_view": GLOBAL_VIEW, "id_stride": 64}))
 
     index = faiss.index_factory(128, f"IVF{args.lists}_HNSW32,PQ{args.pq}", faiss.METRIC_INNER_PRODUCT)
@@ -108,7 +113,7 @@ def main() -> None:
             added += len(ids)
         if number % 10 == 0 or number == len(movies):
             note(f"added {number}/{len(movies)} movies, {added:,}/{total:,} vectors")
-    path = OUT / f"tiles4-global-ivf{args.lists}-pq{args.pq}.faiss"
+    path = out / f"tiles4-global-ivf{args.lists}-pq{args.pq}.faiss"
     faiss.write_index(index, str(path))
     note(f"wrote {path} ({path.stat().st_size / 1e9:.1f} GB)")
 

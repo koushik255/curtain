@@ -21,6 +21,7 @@ import argparse
 import json
 import time
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -39,9 +40,11 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--extra", type=int, default=30, help="fresh queries per type on top of the suite")
     parser.add_argument("--seed", type=int, default=11)
+    parser.add_argument("--checkpoint", type=Path, default=LOCAL / "trained_models/combined-rocm-50k-v1/best.pt",
+                        help="query encoder: the model whose arrays built the index (CURTAIN_FAISS_DIR)")
     args = parser.parse_args()
     torch.set_num_threads(16)
-    model = CurtainEncoder.from_checkpoint(LOCAL / "trained_models/combined-rocm-50k-v1/best.pt")
+    model = CurtainEncoder.from_checkpoint(args.checkpoint)
     engine = search.load()
     times = timestamps()
     items = queries(args.extra, args.seed)

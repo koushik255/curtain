@@ -21,7 +21,9 @@ import faiss
 import numpy as np
 from PIL import Image
 
-FAISS_DIR = Path(__file__).resolve().parents[1] / ".local/faiss"
+# The index the site and benchmarks search; CURTAIN_FAISS_DIR picks another
+# (build_faiss.py --out), e.g. one built from a new model's arrays.
+FAISS_DIR = Path(os.environ.get("CURTAIN_FAISS_DIR", Path(__file__).resolve().parents[1] / ".local/faiss"))
 # On-disk copy of tiles4-global-ivf16384-pq32.faiss (rcmindex/ondisk_faiss.py):
 # its inverted lists (~14 GB of PQ codes and ids) live in the .ivfdata file
 # beside it and are memory-mapped, so they sit in the page cache, not the heap.

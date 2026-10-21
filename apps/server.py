@@ -29,7 +29,9 @@ from rcmindex import search as tile_search
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 LOCAL_ROOT = PROJECT_ROOT / ".local"
-DEFAULT_CHECKPOINT = LOCAL_ROOT / "trained_models/combined-rocm-50k-v1/best.pt"
+# The query encoder; it must be the model whose arrays built CURTAIN_FAISS_DIR.
+DEFAULT_CHECKPOINT = Path(os.environ.get("CURTAIN_CHECKPOINT",
+                                         LOCAL_ROOT / "trained_models/combined-rocm-50k-v1/best.pt"))
 # Frame folders per index collection, and the older per-frame records that
 # carry timestamps.
 FRAME_ROOTS = {
