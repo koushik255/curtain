@@ -1,6 +1,9 @@
 # rcmindex
 
-C++/HIP overlapping-tile indexer for ROCm GPUs (built for MI300X/MI325X).
+C++ overlapping-tile indexer for ROCm GPUs (HIP + MIGraphX; MI300X/MI325X)
+and NVIDIA GPUs (CUDA + TensorRT; the RTX 4060). Both builds share the same
+kernels (`src/kernels.hip`) and pipeline; `src/gpu.hpp` maps the HIP runtime
+calls to CUDA.
 It writes the same layout as the 75k Python indexer: `OUT.npy` (fp16
 `[frames, 49, 128]`), `OUT.records.json` and `OUT.json` (timing report).
 
@@ -43,18 +46,63 @@ validate retrieval on the 75k benchmark before a full run.
 
 ## 2. Compute the tile embeddings
 
-Build on a machine with ROCm and MIGraphX (`migraphx-dev`, `libturbojpeg0-dev`,
-`cmake`), then feed it movie folders:
+Both builds need `cmake` (3.25+), a C++20 compiler (GCC 13+), `libturbojpeg0-dev`
+and `libwebp-dev`.
+
+NVIDIA (the 4060 server): the CUDA toolkit (12.x, with `nvcc`) and TensorRT 10
+(`libnvinfer-dev`, `libnvonnxparsers-dev`, or a tarball passed as `-DTENSORRT_ROOT=`).
+`CMAKE_CUDA_ARCHITECTURES` defaults to 89 (RTX 40xx).
+
+```sh
+cmake -S rcmindex -B rcmindex/build-cuda -DRCM_BACKEND=cuda -DCMAKE_BUILD_TYPE=Release
+cmake --build rcmindex/build-cuda -j"$(nproc)"
+```
+
+AMD: ROCm and MIGraphX (`migraphx-dev`).
 
 ```sh
 cmake -S rcmindex -B rcmindex/build -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH=/opt/rocm
 cmake --build rcmindex/build -j"$(nproc)"
-# Each movie's parent folder name becomes its collection: <output>/<collection>/<movie>.npy
-mkdir -p .local/index-input/full-curtain
-ln -s "$PWD/.local/screenshots/New_Movie_2024" .local/index-input/full-curtain/
-ls -d .local/index-input/*/* | rcmindex/build/rcmindex \
+```
+
+The first run builds the trunk for each batch size and resolution and caches
+it next to the model (`trunk_b32_s768.plan` for TensorRT, `.mxr` for
+MIGraphX); a `.plan` only loads on the GPU and TensorRT version that built
+it, so delete it after changing either. Batch 32 should fit the 4060's 8 GB;
+pass `--batch 16` if it runs out of memory.
+
+Frames are read as `.jpg`, or as `.webp` where only the 640 px copy is kept
+(`.local/frames-small/<collection>/<movie>/`). Records always use the `.jpg`
+name, so a movie indexed from its WebP copies matches the catalog. Each movie's
+parent folder name becomes its collection: `<output>/<collection>/<movie>.npy`.
+
+```sh
+# One movie from its WebP copies (the parent folder is already its collection):
+ls -d .local/frames-small/l4-50k-lbfive/The_Godfather_1972 | rcmindex/build-cuda/rcmindex \
   --model .local/rcmindex-model/combined-rocm-50k-v1 --movies-from - --global \
   --output .local/rcmindex-runs/$(date +%Y%m%d-%H%M%S)
+```
+
+A full re-index takes the six validation movies from their originals and
+every other movie from its WebP copies:
+
+```sh
+mkdir -p .local/index-input/full-curtain
+for d in .local/screenshots/*; do  # only movies with no WebP copy
+  [ -d .local/frames-small/full-curtain/"${d##*/}" ] || ln -sfn "$PWD/$d" .local/index-input/full-curtain/
+done
+{ ls -d .local/index-input/full-curtain/*; ls -d .local/frames-small/*/*; } | rcmindex/build-cuda/rcmindex \
+  --model .local/rcmindex-model/combined-rocm-50k-v1 --movies-from - --global \
+  --output .local/rcmindex-runs/$(date +%Y%m%d-%H%M%S)
+```
+
+Check a new GPU or backend against the indexed arrays first (same frames and
+model should agree to fp16 noise):
+
+```sh
+ls -d .local/index-input/full-curtain/* | rcmindex/build-cuda/rcmindex \
+  --model .local/rcmindex-model/combined-rocm-50k-v1 --movies-from - --global --output .local/rcmindex-runs/cuda-check
+.venv/bin/python -m rcmindex.compare_runs .local/rcmindex-runs/cuda-check
 ```
 
 Output per movie: `<collection>/<movie>.npy` (`[frames, 49, 128]` fp16),

@@ -1,17 +1,23 @@
-// rcmindex: overlapping-tile frame indexer for ROCm GPUs.
+// rcmindex: overlapping-tile frame indexer for ROCm and CUDA GPUs.
 //
 // Per batch of frames:
-//   read thread    JPEG read + libjpeg-turbo decode into pinned memory (parallel)
+//   read thread    JPEG/WebP read + CPU decode into pinned memory (parallel)
 //   upload thread  pinned RGB -> device memory
-//   main thread    antialiased resize to 768x768 + normalize (HIP)
-//                  -> ResNet-18 trunk once per frame (MIGraphX, fp16)
-//                  -> 7x7 half-stride window pool + fc + L2 norm (HIP)
+//   main thread    antialiased resize to 768x768 + normalize (HIP/CUDA kernel)
+//                  -> ResNet-18 trunk once per frame (MIGraphX or TensorRT, fp16)
+//                  -> 7x7 half-stride window pool + fc + L2 norm (HIP/CUDA kernel)
 //                  -> async copy to pinned memory, write .npy
 // Slots rotate between stages so disk, decode and compute overlap.
 
 #include <turbojpeg.h>
+#include <webp/decode.h>
 
+#if defined(RCM_CUDA)
+#include <NvInfer.h>
+#include <NvOnnxParser.h>
+#else
 #include <migraphx/migraphx.hpp>
+#endif
 
 #include <algorithm>
 #include <array>
@@ -26,6 +32,8 @@
 #include <fstream>
 #include <functional>
 #include <iostream>
+#include <map>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <ranges>
@@ -46,9 +54,9 @@ namespace {
 
 // ---------------------------------------------------------------- errors
 
-void hip(hipError_t status, std::source_location at = std::source_location::current()) {
+void gpu(hipError_t status, std::source_location at = std::source_location::current()) {
     if (status != hipSuccess)
-        throw std::runtime_error(std::format("{}:{}: HIP error: {}", at.file_name(), at.line(),
+        throw std::runtime_error(std::format("{}:{}: GPU error: {}", at.file_name(), at.line(),
                                              hipGetErrorString(status)));
 }
 
@@ -151,6 +159,98 @@ Head load_head(const fs::path& dir) {
     return h;
 }
 
+#if defined(RCM_CUDA)
+
+class TrtLogger : public nvinfer1::ILogger {
+    void log(Severity severity, const char* message) noexcept override {
+        if (severity <= Severity::kWARNING) std::cerr << "TensorRT: " << message << '\n';
+    }
+};
+TrtLogger trt_logger;
+
+// trunk.onnx is already fp16 (export_model.py), so a strongly typed network runs
+// it in fp16 as is; TensorRT 10 deprecates the kFP16 builder flag for this.
+#if NV_TENSORRT_MAJOR >= 10
+constexpr std::uint32_t kNetworkFlags = 1U << int(nvinfer1::NetworkDefinitionCreationFlag::kSTRONGLY_TYPED);
+#else
+constexpr std::uint32_t kNetworkFlags = 1U << int(nvinfer1::NetworkDefinitionCreationFlag::kEXPLICIT_BATCH);
+#endif
+
+// A TensorRT engine built for one batch and input size, with its device buffers.
+struct Trunk {
+    std::unique_ptr<nvinfer1::IRuntime> runtime;
+    std::unique_ptr<nvinfer1::ICudaEngine> engine;
+    std::unique_ptr<nvinfer1::IExecutionContext> context;  // declared last: destroyed first
+    __half* input = nullptr;
+    const __half* output = nullptr;
+    std::vector<void*> owned;
+    int side = 0;  // output feature map side
+};
+
+Trunk compile_trunk(const fs::path& model_dir, int batch, int size) {
+    // Building takes a minute or two; cache the engine. A .plan only loads on
+    // the GPU model and TensorRT version that built it: delete it after either changes.
+    const fs::path cache = model_dir / std::format("trunk_b{}_s{}.plan", batch, size);
+    const nvinfer1::Dims4 shape{batch, 3, size, size};
+    if (!fs::exists(cache)) {
+        std::unique_ptr<nvinfer1::IBuilder> builder(nvinfer1::createInferBuilder(trt_logger));
+        std::unique_ptr<nvinfer1::INetworkDefinition> network(builder->createNetworkV2(kNetworkFlags));
+        std::unique_ptr<nvonnxparser::IParser> parser(nvonnxparser::createParser(*network, trt_logger));
+        if (!parser->parseFromFile((model_dir / "trunk.onnx").c_str(), int(nvinfer1::ILogger::Severity::kWARNING)))
+            throw std::runtime_error("TensorRT cannot parse trunk.onnx");
+        std::unique_ptr<nvinfer1::IBuilderConfig> config(builder->createBuilderConfig());
+#if NV_TENSORRT_MAJOR < 10
+        config->setFlag(nvinfer1::BuilderFlag::kFP16);
+#endif
+        // trunk.onnx has dynamic batch/height/width; build for exactly this shape.
+        nvinfer1::IOptimizationProfile* profile = builder->createOptimizationProfile();
+        for (const auto which : {nvinfer1::OptProfileSelector::kMIN, nvinfer1::OptProfileSelector::kOPT,
+                                 nvinfer1::OptProfileSelector::kMAX})
+            profile->setDimensions("images", which, shape);
+        config->addOptimizationProfile(profile);
+        std::cerr << std::format("building TensorRT engine for batch {} at {}x{} (one-off)\n", batch, size, size);
+        std::unique_ptr<nvinfer1::IHostMemory> plan(builder->buildSerializedNetwork(*network, *config));
+        if (!plan) throw std::runtime_error("TensorRT engine build failed");
+        std::ofstream(cache, std::ios::binary).write(static_cast<const char*>(plan->data()), plan->size());
+    }
+    Trunk t;
+    const std::string plan = slurp(cache);
+    t.runtime.reset(nvinfer1::createInferRuntime(trt_logger));
+    t.engine.reset(t.runtime->deserializeCudaEngine(plan.data(), plan.size()));
+    if (!t.engine) throw std::runtime_error(std::format("cannot load {}; delete it to rebuild", cache.string()));
+    t.context.reset(t.engine->createExecutionContext());
+    if (!t.context->setInputShape("images", shape)) throw std::runtime_error("trunk.onnx has no 'images' input");
+    for (int i = 0; i < t.engine->getNbIOTensors(); ++i) {
+        const char* name = t.engine->getIOTensorName(i);
+        if (t.engine->getTensorDataType(name) != nvinfer1::DataType::kHALF)
+            throw std::runtime_error(std::format("trunk tensor {} is not fp16", name));
+        const nvinfer1::Dims dims = t.context->getTensorShape(name);
+        std::size_t count = 1;
+        for (int d = 0; d < dims.nbDims; ++d) count *= std::size_t(dims.d[d]);
+        void* buffer = nullptr;
+        gpu(hipMalloc(&buffer, count * sizeof(__half)));
+        t.owned.push_back(buffer);
+        t.context->setTensorAddress(name, buffer);
+        if (t.engine->getTensorIOMode(name) == nvinfer1::TensorIOMode::kINPUT) {
+            t.input = static_cast<__half*>(buffer);
+        } else {
+            t.output = static_cast<const __half*>(buffer);
+            t.side = int(dims.d[3]);
+        }
+    }
+    if (!t.input || !t.output) throw std::runtime_error("trunk.onnx needs one input and one output");
+    return t;
+}
+
+const __half* run_trunk(Trunk& t, hipStream_t stream) {
+    if (!t.context->enqueueV3(stream)) throw std::runtime_error("TensorRT enqueue failed");
+    return t.output;
+}
+
+constexpr const char* kEncoder = "tensorrt_fp16_shared_trunk";
+
+#else
+
 // A trunk compiled for one batch and input size, with its device buffers.
 struct Trunk {
     migraphx::program program;
@@ -178,7 +278,7 @@ Trunk compile_trunk(const fs::path& model_dir, int batch, int size) {
     auto shapes = t.program.get_parameter_shapes();
     for (const char* name : shapes.names()) {
         void* buffer = nullptr;
-        hip(hipMalloc(&buffer, shapes[name].bytes()));
+        gpu(hipMalloc(&buffer, shapes[name].bytes()));
         t.owned.push_back(buffer);
         if (std::string_view(name) == "images") t.input = static_cast<__half*>(buffer);
         t.parameters.add(name, migraphx::argument(shapes[name], buffer));
@@ -196,6 +296,10 @@ const __half* run_trunk(Trunk& t, hipStream_t stream) {
     return reinterpret_cast<const __half*>(results[0].data());
 }
 
+constexpr const char* kEncoder = "migraphx_fp16_shared_trunk";
+
+#endif
+
 // ---------------------------------------------------------------- frames
 
 struct Frames {
@@ -203,8 +307,10 @@ struct Frames {
     std::vector<std::string> names; // relative to --frames, for records
 };
 
-// JPEGs directly in `root` and in its movie subdirectories, sorted; record
-// names are relative to `base`.
+// Frames directly in `root` and in its movie subdirectories, sorted: JPEGs,
+// or WebP copies (.local/frames-small/) where the original was pruned; a JPEG
+// wins over a WebP of the same name. Record names are relative to `base` and
+// always end in .jpg, the frame's catalog name, so a copy indexes as its original.
 Frames list_frames(const fs::path& root, const fs::path& base, std::size_t limit) {
     std::vector<fs::path> dirs{root};
     for (const auto& entry : fs::directory_iterator(root))
@@ -212,13 +318,16 @@ Frames list_frames(const fs::path& root, const fs::path& base, std::size_t limit
     std::ranges::sort(dirs);
     Frames f;
     for (const auto& dir : dirs) {
-        std::vector<fs::path> jpgs;
-        for (const auto& entry : fs::directory_iterator(dir))
-            if (entry.is_regular_file() && entry.path().extension() == ".jpg") jpgs.push_back(entry.path());
-        std::ranges::sort(jpgs);
-        for (auto& p : jpgs) {
+        std::map<std::string, fs::path> frames;  // stem -> file, sorted by stem
+        for (const auto& entry : fs::directory_iterator(dir)) {
+            const fs::path& p = entry.path();
+            if (!entry.is_regular_file() || (p.extension() != ".jpg" && p.extension() != ".webp")) continue;
+            auto [at, added] = frames.try_emplace(p.stem().string(), p);
+            if (!added && p.extension() == ".jpg") at->second = p;
+        }
+        for (auto& [stem, p] : frames) {
             if (limit && f.paths.size() == limit) return f;
-            f.names.push_back(fs::relative(p, base).generic_string());
+            f.names.push_back(fs::relative(p, base).replace_extension(".jpg").generic_string());
             f.paths.push_back(std::move(p));
         }
     }
@@ -297,7 +406,7 @@ struct Slot {
     std::size_t first = 0;  // index of the batch's first frame
     int count = 0;
     int max_height = 0;
-    std::vector<std::vector<std::uint8_t>> bytes;  // encoded JPEGs
+    std::vector<std::vector<std::uint8_t>> bytes;  // encoded JPEG/WebP files
     std::vector<std::uint8_t*> host_rgb;           // pinned, decoded RGB per frame
     std::vector<std::size_t> host_capacity;
     std::vector<std::uint8_t*> decoded;            // device RGB (interleaved) per frame
@@ -316,8 +425,8 @@ void add(std::atomic<double>& total, double value) {
     total.fetch_add(value, std::memory_order_relaxed);
 }
 
-// Reader threads read and decode JPEGs on the CPU (libjpeg-turbo) straight
-// into pinned memory. GPU JPEG decoding (rocJPEG) is avoided: its VA-API
+// Reader threads read and decode JPEGs (libjpeg-turbo) and WebPs (libwebp) on
+// the CPU straight into pinned memory. GPU JPEG decoding (rocJPEG) is avoided: its VA-API
 // driver loads a second LLVM next to MIGraphX's and aborts the process.
 void read_stage(const Frames& frames, const Options& o, std::vector<Slot>& slots,
                 Channel<int>& free_slots, Channel<int>& read_slots, Timings& time) {
@@ -338,19 +447,22 @@ void read_stage(const Frames& frames, const Options& o, std::vector<Slot>& slots
                         if (!in) throw std::runtime_error("cannot read " + path.string());
                         auto& bytes = slot.bytes[i];
                         bytes.assign(std::istreambuf_iterator<char>(in), {});
+                        const bool webp = path.extension() == ".webp";
                         int w = 0, h = 0, subsampling = 0, colorspace = 0;
-                        if (tjDecompressHeader3(decoder, bytes.data(), bytes.size(), &w, &h, &subsampling,
-                                                &colorspace))
-                            throw std::runtime_error(std::format("{}: {}", path.string(), tjGetErrorStr2(decoder)));
+                        if (webp ? !WebPGetInfo(bytes.data(), bytes.size(), &w, &h)
+                                 : tjDecompressHeader3(decoder, bytes.data(), bytes.size(), &w, &h, &subsampling,
+                                                       &colorspace) != 0)
+                            throw std::runtime_error(std::format("{}: unreadable header", path.string()));
                         const std::size_t need = std::size_t(w) * h * 3;
                         if (slot.host_capacity[i] < need) {
-                            if (slot.host_rgb[i]) hip(hipHostFree(slot.host_rgb[i]));
-                            hip(hipHostMalloc(&slot.host_rgb[i], need));
+                            if (slot.host_rgb[i]) gpu(hipHostFree(slot.host_rgb[i]));
+                            gpu(hipHostMalloc(&slot.host_rgb[i], need));
                             slot.host_capacity[i] = need;
                         }
-                        if (tjDecompress2(decoder, bytes.data(), bytes.size(), slot.host_rgb[i], w, w * 3, h,
-                                          TJPF_RGB, 0))
-                            throw std::runtime_error(std::format("{}: {}", path.string(), tjGetErrorStr2(decoder)));
+                        if (webp ? !WebPDecodeRGBInto(bytes.data(), bytes.size(), slot.host_rgb[i], need, w * 3)
+                                 : tjDecompress2(decoder, bytes.data(), bytes.size(), slot.host_rgb[i], w, w * 3, h,
+                                                 TJPF_RGB, 0) != 0)
+                            throw std::runtime_error(std::format("{}: cannot decode", path.string()));
                         slot.views[i].width = std::uint32_t(w);
                         slot.views[i].height = std::uint32_t(h);
                     }
@@ -367,7 +479,7 @@ void read_stage(const Frames& frames, const Options& o, std::vector<Slot>& slots
 void upload_stage(std::vector<Slot>& slots, Channel<int>& read_slots, Channel<int>& decoded_slots,
                   Timings& time) {
     hipStream_t copy{};
-    hip(hipStreamCreateWithFlags(&copy, hipStreamNonBlocking));
+    gpu(hipStreamCreateWithFlags(&copy, hipStreamNonBlocking));
     while (const auto next = pop(read_slots)) {
         const auto start = Clock::now();
         Slot& slot = slots[*next];
@@ -376,11 +488,11 @@ void upload_stage(std::vector<Slot>& slots, Channel<int>& read_slots, Channel<in
             FrameView& view = slot.views[i];
             const std::size_t need = std::size_t(view.width) * view.height * 3;
             if (slot.capacity[i] < need) {
-                if (slot.decoded[i]) hip(hipFree(slot.decoded[i]));
-                hip(hipMalloc(&slot.decoded[i], need));
+                if (slot.decoded[i]) gpu(hipFree(slot.decoded[i]));
+                gpu(hipMalloc(&slot.decoded[i], need));
                 slot.capacity[i] = need;
             }
-            hip(hipMemcpyAsync(slot.decoded[i], slot.host_rgb[i], need, hipMemcpyHostToDevice, copy));
+            gpu(hipMemcpyAsync(slot.decoded[i], slot.host_rgb[i], need, hipMemcpyHostToDevice, copy));
             for (int c = 0; c < 3; ++c) {
                 view.plane[c] = slot.decoded[i] + c;  // interleaved RGB
                 view.pitch[c] = view.width * 3;
@@ -388,14 +500,14 @@ void upload_stage(std::vector<Slot>& slots, Channel<int>& read_slots, Channel<in
             view.step = 3;
             slot.max_height = std::max(slot.max_height, int(view.height));
         }
-        hip(hipMemcpyAsync(slot.device_views, slot.views.data(), sizeof(FrameView) * slot.count,
+        gpu(hipMemcpyAsync(slot.device_views, slot.views.data(), sizeof(FrameView) * slot.count,
                            hipMemcpyHostToDevice, copy));
-        hip(hipStreamSynchronize(copy));
+        gpu(hipStreamSynchronize(copy));
         add(time.decode, seconds_since(start));
         push(decoded_slots, *next);
     }
     close(decoded_slots);
-    hip(hipStreamDestroy(copy));
+    gpu(hipStreamDestroy(copy));
 }
 
 // ---------------------------------------------------------------- engine
@@ -429,7 +541,7 @@ struct Engine {
 void setup(Engine& e, const Options& o) {
     e.options = o;
     e.head = load_head(o.model);
-    hip(hipStreamCreateWithFlags(&e.stream, hipStreamNonBlocking));
+    gpu(hipStreamCreateWithFlags(&e.stream, hipStreamNonBlocking));
     for (const int g : o.grids) {
         Scale s;
         s.grid = g;
@@ -442,15 +554,15 @@ void setup(Engine& e, const Options& o) {
                                                  s.trunk.side, g, g));
         s.views = s.steps * s.steps;
         s.suffix = g == e.head.grid ? ".npy" : g == 1 ? ".global.npy" : std::format(".g{}.npy", g);
-        hip(hipMalloc(&s.device_out, sizeof(__half) * o.batch * s.views * e.head.dim));
+        gpu(hipMalloc(&s.device_out, sizeof(__half) * o.batch * s.views * e.head.dim));
         e.max_input = std::max(e.max_input, s.input);
         e.scales.push_back(std::move(s));
     }
     const auto& w = e.head.weights;
-    hip(hipMalloc(&e.weight, w.size() * sizeof(float)));
-    hip(hipMemcpy(e.weight, w.data(), w.size() * sizeof(float), hipMemcpyHostToDevice));
+    gpu(hipMalloc(&e.weight, w.size() * sizeof(float)));
+    gpu(hipMemcpy(e.weight, w.data(), w.size() * sizeof(float), hipMemcpyHostToDevice));
     e.bias = e.weight + std::size_t(e.head.dim) * e.head.features;
-    hip(hipMalloc(&e.scratch, sizeof(float) * o.batch * 3 * e.max_frame_height * e.max_input));
+    gpu(hipMalloc(&e.scratch, sizeof(float) * o.batch * 3 * e.max_frame_height * e.max_input));
     e.slots.resize(o.slots);
     for (Slot& slot : e.slots) {
         slot.bytes.resize(o.batch);
@@ -459,13 +571,13 @@ void setup(Engine& e, const Options& o) {
         slot.decoded.assign(o.batch, nullptr);
         slot.capacity.assign(o.batch, 0);
         slot.views.resize(o.batch);
-        hip(hipMalloc(&slot.device_views, sizeof(FrameView) * o.batch));
+        gpu(hipMalloc(&slot.device_views, sizeof(FrameView) * o.batch));
         for (const Scale& s : e.scales) {
             __half* host = nullptr;
-            hip(hipHostMalloc(&host, sizeof(__half) * o.batch * s.views * e.head.dim));
+            gpu(hipHostMalloc(&host, sizeof(__half) * o.batch * s.views * e.head.dim));
             slot.host_out.push_back(host);
         }
-        hip(hipEventCreateWithFlags(&slot.done, hipEventDisableTiming));
+        gpu(hipEventCreateWithFlags(&slot.done, hipEventDisableTiming));
     }
 }
 
@@ -523,7 +635,7 @@ double index_frames(Engine& e, const Frames& frames, const fs::path& base) {
     auto retire = [&](int s) {
         Slot& slot = e.slots[s];
         auto t = Clock::now();
-        hip(hipEventSynchronize(slot.done));
+        gpu(hipEventSynchronize(slot.done));
         add(time.wait, seconds_since(t));
         t = Clock::now();
         for (std::size_t k = 0; k < outputs.size(); ++k) {
@@ -542,10 +654,10 @@ double index_frames(Engine& e, const Frames& frames, const fs::path& base) {
         const auto t = Clock::now();
         Slot& slot = e.slots[*next];
         if (std::size_t(slot.max_height) > e.max_frame_height) {
-            hip(hipStreamSynchronize(e.stream));
-            hip(hipFree(e.scratch));
+            gpu(hipStreamSynchronize(e.stream));
+            gpu(hipFree(e.scratch));
             e.max_frame_height = slot.max_height;
-            hip(hipMalloc(&e.scratch, sizeof(float) * o.batch * 3 * e.max_frame_height * e.max_input));
+            gpu(hipMalloc(&e.scratch, sizeof(float) * o.batch * 3 * e.max_frame_height * e.max_input));
         }
         for (std::size_t k = 0; k < e.scales.size(); ++k) {
             Scale& s = e.scales[k];
@@ -555,10 +667,10 @@ double index_frames(Engine& e, const Frames& frames, const fs::path& base) {
             pool_project(features, slot.count, e.head.features, s.trunk.side, s.window,
                          s.grid == 1 ? s.window : s.window / 2, s.steps, e.weight, e.bias, dim,
                          s.device_out, e.stream);
-            hip(hipMemcpyAsync(slot.host_out[k], s.device_out, sizeof(__half) * slot.count * s.views * dim,
+            gpu(hipMemcpyAsync(slot.host_out[k], s.device_out, sizeof(__half) * slot.count * s.views * dim,
                                hipMemcpyDeviceToHost, e.stream));
         }
-        hip(hipEventRecord(slot.done, e.stream));
+        gpu(hipEventRecord(slot.done, e.stream));
         add(time.compute, seconds_since(t));
         // The GPU now works on this slot while we write out the previous one.
         if (previous) retire(*previous);
@@ -578,17 +690,17 @@ double index_frames(Engine& e, const Frames& frames, const fs::path& base) {
         grids += std::format("{}{}", grids.empty() ? "" : ", ", s.grid);
     }
     hipDeviceProp_t props{};
-    hip(hipGetDeviceProperties(&props, 0));
+    gpu(hipGetDeviceProperties(&props, 0));
     std::ofstream report(with_suffix(base, ".json"));
     report << std::format(
         "{{\n  \"gpu\": {},\n  \"frames\": {},\n  \"grids\": [{}],\n  \"views_per_frame\": {},\n"
         "  \"embeddings\": {},\n  \"elapsed_seconds\": {:.3f},\n  \"frames_per_second\": {:.1f},\n"
         "  \"views_per_second\": {:.1f},\n  \"batch_size\": {},\n  \"slots\": {},\n  \"readers\": {},\n"
-        "  \"encoder\": \"migraphx_fp16_shared_trunk\",\n  \"decoder\": \"libjpeg-turbo\",\n"
+        "  \"encoder\": {},\n  \"decoder\": \"libjpeg-turbo, libwebp\",\n"
         "  \"stage_seconds\": {{\"read_decode\": {:.3f}, \"upload\": {:.3f}, \"enqueue\": {:.3f}, "
         "\"gpu_wait\": {:.3f}, \"write\": {:.3f}}}\n}}\n",
         json_string(props.name), n, grids, views, n * views, elapsed, n / elapsed, n * views / elapsed,
-        o.batch, o.slots, o.readers, time.read.load(), time.decode.load(), time.compute.load(),
+        o.batch, o.slots, o.readers, json_string(kEncoder), time.read.load(), time.decode.load(), time.compute.load(),
         time.wait.load(), time.write.load());
     return n / elapsed;
 }

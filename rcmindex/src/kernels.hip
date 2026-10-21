@@ -3,8 +3,9 @@
 namespace rcm {
 namespace {
 
-constexpr float kMean[3] = {0.485f, 0.456f, 0.406f};
-constexpr float kStd[3] = {0.229f, 0.224f, 0.225f};
+// In constant memory: CUDA can't index a host constexpr array from a kernel.
+__constant__ float kMean[3] = {0.485f, 0.456f, 0.406f};
+__constant__ float kStd[3] = {0.229f, 0.224f, 0.225f};
 
 // Source span and weight of output pixel `o` along one axis (PyTorch's
 // antialiased bilinear: a triangle filter widened by the downscale factor).
