@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import operator
+import os
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -31,10 +32,20 @@ INDEX_NAME = "tiles4-global-ivf16384-pq32.ondisk.faiss"
 # whole-only 13.2% of crops; max(whole - 0.1, mean) keeps 93.5% and 48.0%.
 WHOLE_HANDICAP = 0.1
 READ_THREADS = 8
-# FAISS candidates per query image, re-scored exactly. On the 502-movie index's
-# validation suite 128 matched 256 (70 vs 71 exact, 80 vs 78 same moment, 91
-# right movie both) with half the frames to read.
-CANDIDATES = 128
+# FAISS tiles per query image; their frames are re-scored exactly. 128 tiles
+# often cover only a few frames (a frame has 50 vectors), so a shot whose
+# frame differs in a small region (a turned head) can miss the cut. 512 reads
+# ~4x the frames (~2,200 vs ~600): FAISS + re-scoring ~110 ms vs ~70 ms on
+# this machine. rank_query.py shows where the right frame lands.
+# Override with CURTAIN_CANDIDATES.
+CANDIDATES = int(os.environ.get("CURTAIN_CANDIDATES", 512))
+# FAISS's approximate (PQ) scores can drop the right frame while keeping one
+# a few frames away in the same shot (2 fps), so the NEIGHBOUR_TOP best
+# re-scored frames also bring in their frames within NEIGHBOURS either side.
+# A Godfather shot whose frame differs only in the face: right frame at #2
+# instead of not fetched; ~100 more frames to read, ~5 ms.
+NEIGHBOUR_TOP = 50
+NEIGHBOURS = 4
 READERS = ThreadPoolExecutor(READ_THREADS)
 
 
@@ -112,6 +123,7 @@ def load(directory: Path = FAISS_DIR, nprobe: int = 64) -> dict:
         "movies": movies,
         "stride": catalog["id_stride"],
         "firsts": np.array([m["first"] for m in movies]),
+        "ends": np.array([m["first"] + m["frames"] for m in movies]),
         "tiles": [np.load(m["tiles"], mmap_mode="r") for m in movies],
         "whole": [np.load(m["global"], mmap_mode="r") for m in movies],
     }
@@ -135,16 +147,38 @@ def frame_vectors(engine: dict, frames: np.ndarray) -> np.ndarray:
     return out
 
 
+def rescore(engine: dict, queries: np.ndarray, frames: np.ndarray) -> np.ndarray:
+    """Exact score of each frame id for queries (the whole image first)."""
+    vectors = frame_vectors(engine, frames)                  # [f, 50, 128]
+    best = (vectors @ queries.T).max(axis=1)                 # [f, q] best view per query image
+    return np.maximum(best[:, 0] - WHOLE_HANDICAP, best.mean(axis=1))
+
+
+def neighbours(engine: dict, frames: np.ndarray, reach: int = NEIGHBOURS) -> np.ndarray:
+    """Frame ids within reach of each frame, in the same movie."""
+    movie = np.searchsorted(engine["firsts"], frames, side="right") - 1
+    near = [np.clip(frames + d, engine["firsts"][movie], engine["ends"][movie] - 1)
+            for d in range(-reach, reach + 1)]
+    return np.unique(np.concatenate(near))
+
+
+def candidate_frames(engine: dict, queries: np.ndarray, count: int = CANDIDATES) -> tuple[np.ndarray, np.ndarray]:
+    """(frame ids, exact scores): the frames of the count FAISS tiles per
+    query image, plus the neighbours of the best NEIGHBOUR_TOP of them."""
+    _, ids = engine["index"].search(queries, count)
+    frames = np.unique(ids[ids >= 0] // engine["stride"])
+    if len(frames) == 0:
+        return frames, np.empty(0, dtype=np.float32)
+    score = rescore(engine, queries, frames)
+    best = frames[np.argsort(-score)[:NEIGHBOUR_TOP]]
+    extra = np.setdiff1d(neighbours(engine, best), frames)
+    return np.concatenate([frames, extra]), np.concatenate([score, rescore(engine, queries, extra)])
+
+
 def search(engine: dict, queries: np.ndarray, candidates: int = CANDIDATES, top: int = 5) -> list[tuple[int, float]]:
     """queries: [q, 128] unit vectors for one search, the whole query image
     first, then its pieces. Returns [(frame id, score)] best first."""
     queries = np.ascontiguousarray(queries, dtype=np.float32)
-    _, ids = engine["index"].search(queries, candidates)
-    frames = np.unique(ids[ids >= 0] // engine["stride"])
-    if len(frames) == 0:
-        return []
-    vectors = frame_vectors(engine, frames)                  # [f, 50, 128]
-    best = (vectors @ queries.T).max(axis=1)                 # [f, q] best view per query image
-    score = np.maximum(best[:, 0] - WHOLE_HANDICAP, best.mean(axis=1))
+    frames, score = candidate_frames(engine, queries, candidates)
     order = np.argsort(-score)[:top]
     return [(int(frames[i]), float(score[i])) for i in order]

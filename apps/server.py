@@ -7,6 +7,7 @@ import io
 import json
 import math
 import operator
+import os
 import time
 from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
@@ -44,11 +45,16 @@ TIMESTAMP_RECORDS = {
 # benchmark it flags ~45% of wrong-movie answers and ~11% of right ones.
 WEAK_SCORE = 0.70
 RESULTS = 5
-# The best ALIGN_CANDIDATES frames are checked with SIFT alignment and the
-# confirmed ones moved to the front. Validation suite: exact frame 62 -> 76
-# of 110 queries, ~100 ms more per search.
-ALIGN_CANDIDATES = 10
-align_pool = ThreadPoolExecutor(8)
+# The best frames are checked with SIFT alignment and the confirmed ones moved
+# to the front (validation suite: exact frame 62 -> 76 of 110 with 10). The
+# first ALIGN_FIRST go at once; only if none is confirmed are the rest of the
+# top ALIGN_CANDIDATES checked, so a found frame costs what it did (~170-230 ms
+# for 10) and a miss ~450 ms more (~670 ms for 40; SIFT is ~50 ms per uncached
+# frame, align.frame_features caches them).
+# Override with CURTAIN_ALIGN_CANDIDATES.
+ALIGN_FIRST = 10
+ALIGN_CANDIDATES = int(os.environ.get("CURTAIN_ALIGN_CANDIDATES", 40))
+align_pool = ThreadPoolExecutor(os.cpu_count() or 8)
 BENCHMARK_SUITE = LOCAL_ROOT / "benchmarks/validation-v1"
 BENCHMARK_RESULTS = LOCAL_ROOT / "benchmarks/results"
 
@@ -203,17 +209,8 @@ class TrainedSearchEngine:
         found = tile_search.search(self.search_index, queries, top=ALIGN_CANDIDATES)
         searched = time.perf_counter()
 
-        # Find where the upload sits in each candidate; confirmed frames first.
-        query = align.features(np.asarray(image.convert("L")))
-
-        def locate(index: int):
-            path = self.frame_path(index)
-            if path is None:
-                return 0, None, (0, 0)
-            frame = align.frame_features(path)
-            return (*align.align(query, frame), frame.size)
-        alignments = list(align_pool.map(locate, [index for index, _ in found]))
-        order = align.rerank(found, alignments)[:RESULTS]
+        alignments = self.align_candidates(image, found)
+        order = align.rerank(found[:len(alignments)], alignments)[:RESULTS]
         finished = time.perf_counter()
         yield {
             "type": "progress",
@@ -240,6 +237,24 @@ class TrainedSearchEngine:
                 "server_total_ms": (finished - started) * 1000,
             },
         }
+
+    def align_candidates(self, image: Image.Image, found: list[tuple[int, float]],
+                         first: int = ALIGN_FIRST) -> list[tuple]:
+        # Where the upload sits in each candidate, for the first `first`, then
+        # the rest of found if none of those is confirmed. One entry per
+        # candidate checked: (agreeing points, matrix or None, frame size).
+        query = align.features(np.asarray(image.convert("L")))
+
+        def locate(index: int):
+            path = self.frame_path(index)
+            if path is None:
+                return 0, None, (0, 0)
+            frame = align.frame_features(path)
+            return (*align.align(query, frame), frame.size)
+        alignments = list(align_pool.map(locate, [index for index, _ in found[:first]]))
+        if not any(a[0] >= align.VERIFIED_POINTS for a in alignments):
+            alignments += align_pool.map(locate, [index for index, _ in found[first:]])
+        return alignments
 
     def frame_index(self, name: str) -> int | None:
         # Row of "<collection>/<movie>/<frame>.jpg"; each span is sorted by filename.

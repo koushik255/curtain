@@ -9,6 +9,7 @@ from that frame; a wrong frame typically gets under ten.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 
 import cv2
@@ -39,6 +40,9 @@ def features(image: np.ndarray) -> Features:
     return Features(points, descriptors, (w, h))
 
 
+# SIFT on a frame is ~50 ms (most of an alignment); ~0.3 MB each, so the
+# cache holds about 300 MB. Frames of the same shot come up again and again.
+@lru_cache(maxsize=1024)
 def frame_features(path: Path) -> Features:
     return features(cv2.imread(str(path), cv2.IMREAD_GRAYSCALE))
 
