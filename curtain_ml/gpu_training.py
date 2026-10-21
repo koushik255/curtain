@@ -51,6 +51,13 @@ class GpuTrainingConfig:
     local_loss_weight: float = 0.5
     forward_chunk_size: int = 2048
     evaluation_interval: int = 2
+    init: str | None = None  # checkpoint to fine-tune from instead of random weights
+    freeze_bn: bool = False  # keep BatchNorm running statistics from init
+    # Loader batches per optimizer step. The contrastive loss then sees
+    # batch_size * accumulate sources (its negatives) while host memory holds
+    # one loader batch and the GPU one forward chunk (gradient caching).
+    accumulate: int = 1
+    progress_interval: int = 10  # optimizer steps between progress lines
 
     def __post_init__(self):
         if self.global_loss_weight < 0 or self.local_loss_weight < 0:
@@ -61,6 +68,8 @@ class GpuTrainingConfig:
             raise ValueError("Forward chunk size must be positive")
         if self.evaluation_interval < 1:
             raise ValueError("Evaluation interval must be positive")
+        if self.accumulate < 1:
+            raise ValueError("Accumulate must be positive")
 
 
 class DecodedFrameDataset(Dataset):
@@ -158,7 +167,10 @@ def train(config: GpuTrainingConfig) -> dict[str, float]:
     device = torch.device("cuda")
     train_loader, evaluation_loaders = _loaders(config, train_paths, eval_paths)
     augmenter = GpuCombinedAugmenter(config.image_size, config.grid_size)
-    model = CurtainEncoder(config.embedding_dim, config.image_size).to(device)
+    model = CurtainEncoder(config.embedding_dim, config.image_size)
+    if config.init:
+        model.load_state_dict(torch.load(config.init, map_location="cpu", weights_only=False)["model"])
+    model = model.to(device)
     model.to(memory_format=torch.channels_last)
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay
@@ -195,13 +207,30 @@ def train(config: GpuTrainingConfig) -> dict[str, float]:
 
     for epoch in range(1, config.epochs + 1):
         model.train()
+        if config.freeze_bn:
+            # Small fine-tuning batches re-estimate the statistics badly and
+            # shift every layer; keep init's (the affine weights still train).
+            for module in model.modules():
+                if isinstance(module, torch.nn.BatchNorm2d):
+                    module.eval()
         started = time.perf_counter()
         epoch_learning_rate = optimizer.param_groups[0]["lr"]
         torch.cuda.reset_peak_memory_stats()
         total_loss = total_global = total_local = 0.0
+        steps = sources = 0
+        pending = []
         for images in train_loader:
+            # Augment each loader batch on the GPU at once (small 192 px views)
+            # and step once `accumulate` of them are collected.
+            pending.append(augmenter(images, device))
+            if len(pending) < config.accumulate:
+                continue
+            full, global_crop, exact_tile, shifted_tile = (
+                torch.cat(family) for family in zip(*pending)
+            )
+            pending = []
+            batch_sources = len(full)
             optimizer.zero_grad(set_to_none=True)
-            full, global_crop, exact_tile, shifted_tile = augmenter(images, device)
             # Interleave view families so BatchNorm sees the same distribution
             # in every forward chunk. Capping the physical forward batch also
             # avoids MIOpen's very-large-N BatchNorm kernel limit while the
@@ -209,19 +238,24 @@ def train(config: GpuTrainingConfig) -> dict[str, float]:
             views = torch.stack(
                 (full, global_crop, exact_tile, shifted_tile), dim=1
             ).flatten(0, 1)
+            chunks = range(0, len(views), config.forward_chunk_size)
+            cached = config.accumulate > 1
             with torch.autocast("cuda", dtype=torch.float16):
-                embeddings = torch.cat(
-                    [
-                        model(views[offset : offset + config.forward_chunk_size])
-                        for offset in range(0, len(views), config.forward_chunk_size)
-                    ]
-                ).reshape(len(images), 4, -1)
+                # Gradient caching: embed every chunk without keeping its
+                # activations, take the loss over all of them, then re-run each
+                # chunk with gradients and feed it its share of the loss gradient.
+                with torch.set_grad_enabled(not cached):
+                    embeddings = torch.cat(
+                        [model(views[offset : offset + config.forward_chunk_size]) for offset in chunks]
+                    )
+                if cached:
+                    embeddings = embeddings.detach().requires_grad_()
                 (
                     full_embedding,
                     global_embedding,
                     exact_embedding,
                     shifted_embedding,
-                ) = embeddings.unbind(dim=1)
+                ) = embeddings.reshape(batch_sources, 4, -1).unbind(dim=1)
                 global_loss = contrastive_loss(
                     full_embedding, global_embedding, config.temperature
                 )
@@ -233,16 +267,28 @@ def train(config: GpuTrainingConfig) -> dict[str, float]:
                     + config.local_loss_weight * local_loss
                 )
             scaler.scale(loss).backward()
+            if cached:
+                for offset in chunks:
+                    end = offset + config.forward_chunk_size
+                    with torch.autocast("cuda", dtype=torch.float16):
+                        chunk = model(views[offset:end])
+                    chunk.backward(embeddings.grad[offset:end])
             scaler.step(optimizer)
             scaler.update()
             total_loss += loss.item()
             total_global += global_loss.item()
             total_local += local_loss.item()
+            steps += 1
+            sources += batch_sources
+            if steps % config.progress_interval == 0:
+                elapsed = time.perf_counter() - started
+                print(f"  epoch {epoch}: step {steps}, {sources} sources, "
+                      f"{sources / elapsed:.0f}/s, loss {total_loss / steps:.4f}", flush=True)
         torch.cuda.synchronize()
         training_seconds = time.perf_counter() - started
         scheduler.step()
 
-        steps = max(1, len(train_loader))
+        steps = max(1, steps)
         training_metrics = {
             "epoch": epoch,
             "training_loss": total_loss / steps,
@@ -250,13 +296,8 @@ def train(config: GpuTrainingConfig) -> dict[str, float]:
             "local_loss": total_local / steps,
             "learning_rate": epoch_learning_rate,
             "training_seconds": training_seconds,
-            "source_frames_per_second": steps
-            * config.batch_size
-            / training_seconds,
-            "model_views_per_second": steps
-            * config.batch_size
-            * 4
-            / training_seconds,
+            "source_frames_per_second": sources / training_seconds,
+            "model_views_per_second": sources * 4 / training_seconds,
             "peak_gpu_memory_gib": torch.cuda.max_memory_allocated() / (1024**3),
         }
         should_evaluate = (
@@ -313,6 +354,11 @@ def parse_args() -> GpuTrainingConfig:
     parser.add_argument("--limit", type=int)
     parser.add_argument("--forward-chunk-size", type=int, default=2048)
     parser.add_argument("--evaluation-interval", type=int, default=2)
+    parser.add_argument("--learning-rate", type=float, default=6e-4)
+    parser.add_argument("--init", type=Path, help="checkpoint to fine-tune from")
+    parser.add_argument("--freeze-bn", action="store_true", help="keep BatchNorm statistics from --init")
+    parser.add_argument("--accumulate", type=int, default=1,
+                        help="loader batches per step: batch-size * accumulate negatives")
     args = parser.parse_args()
     return GpuTrainingConfig(
         data_dir=str(args.data),
@@ -323,6 +369,10 @@ def parse_args() -> GpuTrainingConfig:
         limit=args.limit,
         forward_chunk_size=args.forward_chunk_size,
         evaluation_interval=args.evaluation_interval,
+        learning_rate=args.learning_rate,
+        init=str(args.init) if args.init else None,
+        freeze_bn=args.freeze_bn,
+        accumulate=args.accumulate,
     )
 
 

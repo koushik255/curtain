@@ -93,10 +93,26 @@ QUERY_TYPES = {
         ImageEnhance.Color(ImageEnhance.Contrast(ImageEnhance.Brightness(f).enhance(r.uniform(0.7, 1.3)))
                            .enhance(r.uniform(0.7, 1.3))).enhance(r.uniform(0.6, 1.4)),
         Image.new("RGB", f.size, r.choice([(255, 170, 90), (90, 150, 255)])), r.uniform(0.05, 0.15)), 85),
+    "regrade": lambda f, r: jpeg(_regrade(f, r), 85),
     "letterbox": lambda f, r: jpeg(_letterbox(f, r), 85),
     "subtitles": lambda f, r: jpeg(subtitle(crop(f, r, (0.4, 0.65), (0.4, 0.65)), r), 85),
     "phone_photo": lambda f, r: jpeg(_phone(f, r), 80),
 }
+
+
+def _regrade(frame: Image.Image, rng: random.Random) -> Image.Image:
+    # Another release's colour grade: per-channel gain and gamma, crushed or
+    # lifted blacks, a little saturation (like the Godfather screenshot: less
+    # green and blue, deeper shadows).
+    x = np.asarray(frame, dtype=np.float32) / 255
+    gain = np.array([rng.uniform(0.85, 1.12) for _ in range(3)], dtype=np.float32)
+    gamma = np.array([rng.uniform(0.9, 1.15) for _ in range(3)], dtype=np.float32)
+    x = np.clip(x * gain, 1e-4, 1) ** gamma
+    black = rng.uniform(-0.04, 0.05)
+    x = np.clip((x - black) / (1 - black), 0, 1)
+    grey = x @ np.array([0.299, 0.587, 0.114], dtype=np.float32)
+    x = grey[..., None] + (x - grey[..., None]) * rng.uniform(0.8, 1.3)
+    return Image.fromarray((np.clip(x, 0, 1) * 255).round().astype(np.uint8))
 
 
 def _letterbox(frame: Image.Image, rng: random.Random) -> Image.Image:

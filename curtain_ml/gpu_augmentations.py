@@ -185,26 +185,52 @@ class GpuCombinedAugmenter:
             sampled = self._uniform(count, low, high, device)
             return 1 + (sampled - 1) * strength
 
+        def channel_factor(low: float, high: float) -> torch.Tensor:
+            sampled = torch.empty(count, 3, device=device).uniform_(low, high)
+            return 1 + (sampled - 1) * strength[:, None]
+
         brightness = factor(0.60, 1.40)
         contrast = factor(0.75, 1.25)
-        saturation = factor(0.85, 1.15)
+        saturation = factor(0.50, 1.60)
         gamma = factor(0.75, 1.35)
         temperature = self._uniform(count, -0.08, 0.08, device) * strength
+        # Another release or transfer of a film is regraded per channel: its own
+        # gain and gamma for each channel (tints in any direction, not just
+        # warm-cool), crushed or lifted blacks, and S-shaped or flattened tone
+        # curves. A Godfather screenshot with 18% less green, 10% less blue and
+        # crushed shadows scored 0.57 against its frame, 0.88 once colour-matched.
+        channel_gain = channel_factor(0.85, 1.15)
+        channel_gamma = channel_factor(0.88, 1.14)  # on top of gamma: kept narrow
+        black_point = self._uniform(count, -0.05, 0.06, device) * strength  # > 0 crushes
+        curve = self._uniform(count, -0.5, 0.5, device) * strength  # > 0 adds contrast
+        greyscale = (torch.rand(count, device=device) < 0.05) & ~clean
+
+        def luma(values: torch.Tensor) -> torch.Tensor:
+            return (
+                values[:, 0:1] * 0.299
+                + values[:, 1:2] * 0.587
+                + values[:, 2:3] * 0.114
+            )
 
         images = images * brightness[:, None, None, None]
         contrast_mean = images.mean(dim=(1, 2, 3), keepdim=True)
         images = (images - contrast_mean) * contrast[:, None, None, None] + contrast_mean
-        gray = (
-            images[:, 0:1] * 0.299
-            + images[:, 1:2] * 0.587
-            + images[:, 2:3] * 0.114
-        )
+        gray = luma(images)
         images = gray + (images - gray) * saturation[:, None, None, None]
-        images = images.clamp_(1e-4, 1).pow_(gamma[:, None, None, None])
+        exponent = gamma[:, None] * channel_gamma
+        images = images.clamp_(1e-4, 1).pow_(exponent[:, :, None, None])
         channel_gains = torch.stack(
             (1 + temperature, torch.ones_like(temperature), 1 - temperature), dim=1
-        )
+        ) * channel_gain
         images = (images * channel_gains[:, :, None, None]).clamp_(0, 1)
+        black = black_point[:, None, None, None]
+        images = ((images - black) / (1 - black)).clamp_(0, 1)
+        # Monotonic for |curve| <= 0.5: slope 1 + curve * (6x - 6x^2 - 1) > 0.
+        bend = curve[:, None, None, None]
+        images = images + bend * images * (1 - images) * (2 * images - 1)
+        images = torch.where(
+            greyscale[:, None, None, None], luma(images).expand_as(images), images
+        )
 
         blur_mask = ((torch.rand(count, device=device) < 0.20) & ~clean)[
             :, None, None, None
