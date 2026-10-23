@@ -76,10 +76,13 @@ def main() -> None:
         image = ImageOps.exif_transpose(image).convert("RGB")
     if not args.raw:
         image = browser_upload(image).convert("RGB")
-    views = [image, *search.pieces(image)]
-    tensor = torch.stack([engine.transform(view) for view in views]).to(engine.device)
+    sets = search.query_sets(image)
+    tensor = torch.stack([engine.transform(view) for reading in sets for view in reading]).to(engine.device)
     with torch.inference_mode():
-        queries = np.ascontiguousarray(normalize_rows(engine.model(tensor).float().cpu().numpy()), dtype=np.float32)
+        flat = np.ascontiguousarray(normalize_rows(engine.model(tensor).float().cpu().numpy()), dtype=np.float32)
+    bounds = np.cumsum([0, *map(len, sets)])
+    readings = [flat[start:end] for start, end in zip(bounds, bounds[1:])]
+    queries = readings[0]  # as uploaded: the per-view FAISS report below is for this reading
 
     print(f"\nquery {image.size[0]}x{image.size[1]}, expected {movie['movie']} "
           f"(frames {first}-{first + count - 1})" + (f", frame {target}" if target is not None else ""))
@@ -100,19 +103,20 @@ def main() -> None:
             line += f" movie: none (cut-off {scores[v][valid][-1]:.3f})" if valid.any() else " no results"
         print(line)
 
-    frames, score = search.candidate_frames(index, queries, args.candidates)
+    frames, score = search.candidate_frames(index, readings, args.candidates)
     fetched = len(np.unique(ids[ids >= 0] // index["stride"]))
     order = np.argsort(-score)
     ranked, ranked_score = frames[order], score[order]
     in_movie = np.flatnonzero((ranked >= first) & (ranked < first + count))
-    print(f"\nre-scored {len(frames)} candidate frames ({fetched} from FAISS, {len(frames) - fetched} neighbours)")
+    print(f"\nre-scored {len(frames)} candidate frames ({fetched} from FAISS as uploaded, {len(frames) - fetched} from neighbours "
+          f"and {len(readings) - 1} other reading(s))")
     if len(in_movie):
         r = in_movie[0]
         print(f"  movie's best frame: rank {r + 1} of {len(frames)}, {label(engine, ranked[r])} ({ranked_score[r]:.4f})")
     else:
         print("  movie's best frame: not among the candidates")
     if target is not None:
-        own = float(search.rescore(index, queries, np.array([target]))[0])
+        own = max(float(search.rescore(index, r, np.array([target]))[0]) for r in readings)
         rank = int((ranked_score > own).sum()) + 1
         where = "a candidate" if target in frames else "NOT a candidate"
         print(f"  expected frame: {own:.4f}, would rank {rank} ({where})")
@@ -123,7 +127,7 @@ def main() -> None:
 
     if args.scan:
         every = np.arange(first, first + count)
-        movie_score = np.concatenate([search.rescore(index, queries, every[i:i + SCAN_CHUNK])
+        movie_score = np.concatenate([np.max([search.rescore(index, r, every[i:i + SCAN_CHUNK]) for r in readings], axis=0)
                                       for i in range(0, count, SCAN_CHUNK)])
         best = np.argsort(-movie_score)[:5]
         print(f"\nscan of all {count} frames of the movie (rank among the candidates if they had been one):")

@@ -58,6 +58,73 @@ def pieces(image: Image.Image) -> list[Image.Image]:
     return [image.crop((x, y, x + pw, y + ph)) for y in (0, h - ph) for x in (0, w - pw)]
 
 
+# Letterbox bars: whole rows/columns at an edge that are uniformly black. A dark
+# scene still has a highlight or noise somewhere along a full row; JPEG ringing
+# next to the picture can lift a bar's last row, which then just stays.
+BAR_MAX, BAR_STD = 28, 4.0
+BAR_MIN = 0.02  # thinner than this (of the side) is a dark edge, not a bar
+
+
+def trim_bars(image: Image.Image) -> Image.Image:
+    """The query without black letterbox/pillarbox bars (unchanged if none, or
+    if they would leave less than a quarter of a side, e.g. a black frame)."""
+    gray = np.asarray(image.convert("L"), dtype=np.float32)
+
+    def bars(lines: np.ndarray) -> int:
+        count = 0
+        for line in lines:
+            if line.max() > BAR_MAX or line.std() > BAR_STD:
+                break
+            count += 1
+        return count if count >= BAR_MIN * len(lines) else 0
+    h, w = gray.shape
+    top, bottom, left, right = bars(gray), bars(gray[::-1]), bars(gray.T), bars(gray.T[::-1])
+    if h - top - bottom < h / 4:
+        top = bottom = 0
+    if w - left - right < w / 4:
+        left = right = 0
+    return image.crop((left, top, w - right, h - bottom)) if top or bottom or left or right else image
+
+
+# Index tiles cover frame-shaped regions (a quarter of each side) squashed to
+# 192x192, so a sliver much taller or wider than a frame is searched as a strip
+# of overlapping frame-shaped pieces rather than squashed whole.
+FRAME_ASPECT = 16 / 9
+MAX_STRIPS = 8
+
+
+def strips(image: Image.Image) -> list[Image.Image] | None:
+    """Frame-shaped pieces along a sliver at half-piece steps, or None if the
+    image is roughly frame-shaped (then the corner pieces apply)."""
+    w, h = image.size
+    tall = w / h < FRAME_ASPECT / 2
+    if not tall and w / h <= FRAME_ASPECT * 2:
+        return None
+    side, length = (w, h) if tall else (h, w)
+    piece = side / FRAME_ASPECT if tall else side * FRAME_ASPECT
+    count = min(MAX_STRIPS, max(2, int(np.ceil((length - piece) / (piece / 2))) + 1))
+    starts = np.linspace(0, length - piece, count).round().astype(int)
+    size = int(round(piece))
+    return [image.crop((0, s, w, s + size)) if tall else image.crop((s, 0, s + size, h)) for s in starts]
+
+
+def query_sets(image: Image.Image) -> list[list[Image.Image]]:
+    """Readings of one query, each a list of images to embed with the whole
+    first: as uploaded with its corner pieces; then, only where they apply,
+    with letterbox bars trimmed, and as a sliver's frame-shaped strips.
+    search() keeps each frame's best score over the readings, so a reading
+    that does not apply (a dark scene's black edge trimmed, bars that are part
+    of the indexed frame) cannot push the right frame down."""
+    sets = [[image, *pieces(image)]]
+    trimmed = trim_bars(image)
+    if trimmed is not image:
+        sets.append([trimmed, *pieces(trimmed)])
+    for reading in [image] if trimmed is image else [image, trimmed]:
+        if parts := strips(reading):
+            sets.append([reading, *parts])
+    return sets
+
+
 class FrameNames(Sequence):
     """catalog.json "names" ("<collection>/<movie>/<frame>.jpg" in frame-id
     order), stored as one fixed-width bytes array of frame filenames plus the
@@ -164,9 +231,19 @@ def neighbours(engine: dict, frames: np.ndarray, reach: int = NEIGHBOURS) -> np.
     return np.unique(np.concatenate(near))
 
 
-def candidate_frames(engine: dict, queries: np.ndarray, count: int = CANDIDATES) -> tuple[np.ndarray, np.ndarray]:
+def candidate_frames(engine: dict, queries: np.ndarray | list[np.ndarray],
+                     count: int = CANDIDATES) -> tuple[np.ndarray, np.ndarray]:
     """(frame ids, exact scores): the frames of the count FAISS tiles per
-    query image, plus the neighbours of the best NEIGHBOUR_TOP of them."""
+    query image, plus the neighbours of the best NEIGHBOUR_TOP of them. Given
+    several readings of a query (query_sets), each frame keeps its best score."""
+    if isinstance(queries, list):
+        found = [candidate_frames(engine, np.ascontiguousarray(q, dtype=np.float32), count) for q in queries]
+        frames = np.unique(np.concatenate([f for f, _ in found]))
+        score = np.full(len(frames), -np.inf, dtype=np.float32)
+        for f, s in found:
+            at = np.searchsorted(frames, f)
+            score[at] = np.maximum(score[at], s)
+        return frames, score
     _, ids = engine["index"].search(queries, count)
     frames = np.unique(ids[ids >= 0] // engine["stride"])
     if len(frames) == 0:
@@ -177,10 +254,13 @@ def candidate_frames(engine: dict, queries: np.ndarray, count: int = CANDIDATES)
     return np.concatenate([frames, extra]), np.concatenate([score, rescore(engine, queries, extra)])
 
 
-def search(engine: dict, queries: np.ndarray, candidates: int = CANDIDATES, top: int = 5) -> list[tuple[int, float]]:
+def search(engine: dict, queries: np.ndarray | list[np.ndarray], candidates: int = CANDIDATES,
+           top: int = 5) -> list[tuple[int, float]]:
     """queries: [q, 128] unit vectors for one search, the whole query image
-    first, then its pieces. Returns [(frame id, score)] best first."""
-    queries = np.ascontiguousarray(queries, dtype=np.float32)
+    first, then its pieces; or a list of those, one per reading (query_sets).
+    Returns [(frame id, score)] best first."""
+    if not isinstance(queries, list):
+        queries = np.ascontiguousarray(queries, dtype=np.float32)
     frames, score = candidate_frames(engine, queries, candidates)
     order = np.argsort(-score)[:top]
     return [(int(frames[i]), float(score[i])) for i in order]

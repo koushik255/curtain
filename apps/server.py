@@ -191,9 +191,12 @@ class TrainedSearchEngine:
         started = time.perf_counter()
         with Image.open(io.BytesIO(data)) as image:
             image = ImageOps.exif_transpose(image).convert("RGB")
-        # The whole query plus four overlapping pieces: a crop that covers only
-        # part of a frame still matches that frame's tiles piece by piece.
-        views = [image, *tile_search.pieces(image)]
+        # The whole query plus four overlapping pieces (a crop that covers only
+        # part of a frame still matches that frame's tiles piece by piece), and
+        # where they apply the query with letterbox bars trimmed and a sliver as
+        # frame-shaped strips; each is one reading, embedded in one batch.
+        sets = tile_search.query_sets(image)
+        views = [view for reading in sets for view in reading]
         tensor = torch.stack([self.transform(view) for view in views]).to(self.device)
         decoded = time.perf_counter()
         yield {"type": "stage", "stage": "decoded", "elapsed_ms": (decoded - started) * 1000}
@@ -208,7 +211,9 @@ class TrainedSearchEngine:
             "embedding_ms": (embedded - decoded) * 1000,
         }
 
-        found = tile_search.search(self.search_index, queries, top=ALIGN_CANDIDATES)
+        bounds = np.cumsum([0, *map(len, sets)])
+        readings = [queries[start:end] for start, end in zip(bounds, bounds[1:])]
+        found = tile_search.search(self.search_index, readings, top=ALIGN_CANDIDATES)
         searched = time.perf_counter()
 
         alignments = self.align_candidates(image, found)
