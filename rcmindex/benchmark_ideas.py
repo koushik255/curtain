@@ -20,7 +20,7 @@ the first 20 results, the unaligned ones in search order after the aligned,
 as the page shows them).
 
     CURTAIN_FAISS_DIR=.local/faiss-subset63-new .venv/bin/python -m rcmindex.benchmark_ideas \\
-        --checkpoint .local/trained_models/colour-ft-v1/best.pt
+        --checkpoint curtain_models/colour-ft-v1/best.pt
 """
 
 from __future__ import annotations

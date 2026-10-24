@@ -14,7 +14,7 @@ already on the volume are not uploaded again. The local frames are never
 touched. Afterwards delete the volume (modal volume delete curtain-reindex)
 and build an index from --out with build_faiss.py --runs.
 
-    nohup .venv/bin/python -m rcmindex.reindex_modal --model .local/rcmindex-model/colour-ft-v1 \\
+    nohup .venv/bin/python -m rcmindex.reindex_modal --model curtain_models/colour-ft-v1-onnx \\
         --out .local/rcmindex-runs-colour-ft-v1 > .local/reindex-modal.log 2>&1 &
 """
 

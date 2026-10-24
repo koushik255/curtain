@@ -14,6 +14,8 @@
 /training_runs/
 /runs/
 /models/
+/curtain_models/*
+!/curtain_models/README.md
 *.npy
 *.npz
 *.pt

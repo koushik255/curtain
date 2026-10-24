@@ -8,7 +8,7 @@ current one indexes. Resumable: movies whose report is already in --out are
 skipped. Then build an index from --out with build_faiss.py --runs.
 
     .venv/bin/python -m rcmindex.reindex_remote --host koush@100.120.236.103 \\
-        --model .local/rcmindex-model/colour-ft-v1 --out .local/rcmindex-runs-colour-ft-v1
+        --model curtain_models/colour-ft-v1-onnx --out .local/rcmindex-runs-colour-ft-v1
 """
 
 from __future__ import annotations
