@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import random
+import re
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -58,6 +59,11 @@ class GpuTrainingConfig:
     # one loader batch and the GPU one forward chunk (gradient caching).
     accumulate: int = 1
     progress_interval: int = 10  # optimizer steps between progress lines
+    # Hard negatives from the same shot: each source comes with a frame up to
+    # this many frames later in its film (0.5-1.5 s at 2 fps), in the same
+    # batch, so the loss must tell neighbouring frames apart. 0: off.
+    neighbours: int = 0
+    hard: bool = False  # GpuCombinedAugmenter(hard=True): reshaped tiles, overlays, grain
 
     def __post_init__(self):
         if self.global_loss_weight < 0 or self.local_loss_weight < 0:
@@ -87,9 +93,55 @@ class DecodedFrameDataset(Dataset):
             return pil_to_tensor(image)
 
 
+class NeighbourPairDataset(Dataset):
+    """(frame, neighbour) pairs, decoded like DecodedFrameDataset."""
+
+    def __init__(self, pairs: list[tuple[Path, Path]]):
+        self.pairs = pairs
+
+    def __len__(self) -> int:
+        return len(self.pairs)
+
+    def __getitem__(self, index: int) -> list[torch.Tensor]:
+        return [DecodedFrameDataset([path])[0] for path in self.pairs[index]]
+
+
+def flatten_pairs(items: list[list[torch.Tensor]]) -> list[torch.Tensor]:
+    return [image for pair in items for image in pair]
+
+
+def frame_number(path: Path) -> int:
+    digits = re.findall(r"\d+", path.stem)
+    return int(digits[-1]) if digits else -1
+
+
+def neighbour_pairs(movies: dict[str, list[Path]], names: list[str], reach: int,
+                    limit: int | None, seed: int) -> list[tuple[Path, Path]]:
+    """Disjoint (frame, later frame within reach) pairs from each film, by
+    frame number (a folder may hold only a sample, its pairs included)."""
+    rng = random.Random(seed)
+    pairs = []
+    for name in names:
+        frames = sorted(movies[name], key=frame_number)
+        numbers = [frame_number(path) for path in frames]
+        used = set()
+        for i, number in enumerate(numbers):
+            if i in used:
+                continue
+            later = [j for j in range(i + 1, min(len(frames), i + reach + 1))
+                     if j not in used and 0 < numbers[j] - number <= reach]
+            if later:
+                j = rng.choice(later)
+                used |= {i, j}
+                pairs.append((frames[i], frames[j]))
+    if limit is not None and limit < len(pairs):
+        pairs = rng.sample(pairs, limit)
+    return pairs
+
+
 def _loaders(
     config: GpuTrainingConfig,
-    train_paths: list[Path],
+    train_paths: list[Path] | list[tuple[Path, Path]],
     eval_paths: list[Path],
 ) -> tuple[DataLoader, dict[str, DataLoader]]:
     # Variable-sized decoded images are returned as a list. Filesystem-backed
@@ -103,10 +155,10 @@ def _loaders(
         "persistent_workers": config.workers > 0,
     }
     train_loader = DataLoader(
-        DecodedFrameDataset(train_paths),
+        NeighbourPairDataset(train_paths) if config.neighbours else DecodedFrameDataset(train_paths),
         shuffle=True,
         drop_last=True,
-        collate_fn=list,
+        collate_fn=flatten_pairs if config.neighbours else list,
         # Full-resolution decoded frames are large. One queued batch per worker
         # keeps host/shared-memory use bounded on large logical GPU batches.
         prefetch_factor=1 if config.workers else None,
@@ -146,7 +198,10 @@ def train(config: GpuTrainingConfig) -> dict[str, float]:
     output_dir.mkdir(parents=True, exist_ok=True)
     movies = discover_movies(data_dir)
     train_movies, eval_movies = split_movies(movies, config.eval_movies, config.seed)
-    train_paths = select_paths(movies, train_movies, config.limit, config.seed)
+    if config.neighbours:  # batch_size and limit count pairs: 2 sources each
+        train_paths = neighbour_pairs(movies, train_movies, config.neighbours, config.limit, config.seed)
+    else:
+        train_paths = select_paths(movies, train_movies, config.limit, config.seed)
     eval_paths = select_paths(movies, eval_movies, config.limit, config.seed + 1)
     if len(train_paths) < config.batch_size or len(eval_paths) < 2:
         raise RuntimeError("The selected split is too small for this configuration.")
@@ -154,7 +209,7 @@ def train(config: GpuTrainingConfig) -> dict[str, float]:
     split_manifest = {
         "training_movies": train_movies,
         "evaluation_movies": eval_movies,
-        "training_frames": len(train_paths),
+        "training_frames": len(train_paths) * (2 if config.neighbours else 1),
         "evaluation_frames": len(eval_paths),
     }
     (output_dir / "split.json").write_text(json.dumps(split_manifest, indent=2) + "\n")
@@ -166,7 +221,7 @@ def train(config: GpuTrainingConfig) -> dict[str, float]:
 
     device = torch.device("cuda")
     train_loader, evaluation_loaders = _loaders(config, train_paths, eval_paths)
-    augmenter = GpuCombinedAugmenter(config.image_size, config.grid_size)
+    augmenter = GpuCombinedAugmenter(config.image_size, config.grid_size, config.hard)
     model = CurtainEncoder(config.embedding_dim, config.image_size)
     if config.init:
         model.load_state_dict(torch.load(config.init, map_location="cpu", weights_only=False)["model"])
@@ -222,12 +277,12 @@ def train(config: GpuTrainingConfig) -> dict[str, float]:
         for images in train_loader:
             # Augment each loader batch on the GPU at once (small 192 px views)
             # and step once `accumulate` of them are collected.
-            pending.append(augmenter(images, device))
+            pending.append(augmenter(images, device, paired=bool(config.neighbours)))
             if len(pending) < config.accumulate:
                 continue
-            full, global_crop, exact_tile, shifted_tile = (
-                torch.cat(family) for family in zip(*pending)
-            )
+            families = [torch.cat(family) for family in zip(*pending)]
+            full, global_crop, exact_tile, shifted_tile = families[:4]
+            same_pairs = families[4] if config.neighbours else None
             pending = []
             batch_sources = len(full)
             optimizer.zero_grad(set_to_none=True)
@@ -257,10 +312,10 @@ def train(config: GpuTrainingConfig) -> dict[str, float]:
                     shifted_embedding,
                 ) = embeddings.reshape(batch_sources, 4, -1).unbind(dim=1)
                 global_loss = contrastive_loss(
-                    full_embedding, global_embedding, config.temperature
+                    full_embedding, global_embedding, config.temperature, same_pairs
                 )
                 local_loss = contrastive_loss(
-                    exact_embedding, shifted_embedding, config.temperature
+                    exact_embedding, shifted_embedding, config.temperature, same_pairs
                 )
                 loss = (
                     config.global_loss_weight * global_loss
@@ -359,6 +414,10 @@ def parse_args() -> GpuTrainingConfig:
     parser.add_argument("--freeze-bn", action="store_true", help="keep BatchNorm statistics from --init")
     parser.add_argument("--accumulate", type=int, default=1,
                         help="loader batches per step: batch-size * accumulate negatives")
+    parser.add_argument("--neighbours", type=int, default=0,
+                        help="pair each frame with one up to this many frames later (hard negatives)")
+    parser.add_argument("--hard", action="store_true", help="reshaped tiles, overlays, grain")
+    parser.add_argument("--eval-movies", type=int, default=6)
     args = parser.parse_args()
     return GpuTrainingConfig(
         data_dir=str(args.data),
@@ -373,6 +432,9 @@ def parse_args() -> GpuTrainingConfig:
         init=str(args.init) if args.init else None,
         freeze_bn=args.freeze_bn,
         accumulate=args.accumulate,
+        neighbours=args.neighbours,
+        hard=args.hard,
+        eval_movies=args.eval_movies,
     )
 
 

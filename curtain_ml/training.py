@@ -274,13 +274,22 @@ class GridRetrievalDataset(Dataset):
 
 
 def contrastive_loss(
-    first: torch.Tensor, second: torch.Tensor, temperature: float
+    first: torch.Tensor, second: torch.Tensor, temperature: float,
+    same_pairs: torch.Tensor | None = None,
 ) -> torch.Tensor:
     # Compute symmetric in-batch InfoNCE for two views of every source frame.
+    # same_pairs: for a batch of (frame, neighbour) pairs, which pairs are one
+    # picture; those two are then not each other's negatives.
     batch_size = first.shape[0]
     embeddings = torch.cat((first, second), dim=0)
     logits = embeddings.float() @ embeddings.float().T / temperature
     logits.fill_diagonal_(float("-inf"))
+    if same_pairs is not None:
+        source = torch.arange(2 * batch_size, device=embeddings.device) % batch_size
+        pair = source // 2
+        twin = ((pair[:, None] == pair[None, :]) & (source[:, None] != source[None, :])
+                & same_pairs[pair][:, None])
+        logits = logits.masked_fill(twin, float("-inf"))
     targets = torch.arange(2 * batch_size, device=embeddings.device)
     targets = (targets + batch_size) % (2 * batch_size)
     return functional.cross_entropy(logits, targets)
