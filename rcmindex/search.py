@@ -108,10 +108,36 @@ def strips(image: Image.Image) -> list[Image.Image] | None:
     return [image.crop((0, s, w, s + size)) if tall else image.crop((s, 0, s + size, h)) for s in starts]
 
 
-def query_sets(image: Image.Image) -> list[list[Image.Image]]:
+def levels(image: Image.Image) -> Image.Image:
+    """Each channel stretched so its 1st-99th percentile spans 0-255: auto
+    levels, which also takes out a colour cast."""
+    pixels = np.asarray(image, dtype=np.float32)
+    low, high = np.percentile(pixels.reshape(-1, 3), [1, 99], axis=0)
+    out = (pixels - low) / np.maximum(high - low, 1) * 255
+    return Image.fromarray(out.clip(0, 255).astype(np.uint8))
+
+
+def grid(image: Image.Image, n: int = 3, size: float = 0.45) -> list[Image.Image]:
+    """An n x n grid of overlapping pieces, each `size` of the width and height."""
+    w, h = image.size
+    pw, ph = int(w * size), int(h * size)
+    return [image.crop((x, y, x + pw, y + ph))
+            for y in np.linspace(0, h - ph, n).astype(int) for x in np.linspace(0, w - pw, n).astype(int)]
+
+
+# The levels reading (benchmark_ideas.py, 470 queries on 63 films): exact
+# frame 348 -> 356 with the original model (colour-shifted 13 -> 19 of 40),
+# but 401 -> 399 with colour-ft-v1, which already ignores grading. Turn it off
+# (CURTAIN_COLOUR_READING=0) with a colour-robust model's index.
+COLOUR_READING = os.environ.get("CURTAIN_COLOUR_READING", "1") != "0"
+
+
+def query_sets(image: Image.Image, colour: bool = COLOUR_READING, finer: bool = True) -> list[list[Image.Image]]:
     """Readings of one query, each a list of images to embed with the whole
     first: as uploaded with its corner pieces; then, only where they apply,
-    with letterbox bars trimmed, and as a sliver's frame-shaped strips.
+    with letterbox bars trimmed, and as a sliver's frame-shaped strips; then
+    with auto levels (colour) and with a 3x3 grid of smaller pieces (finer;
+    exact frame 348 -> 353 and 401 -> 406, mostly wide crops and subtitles).
     search() keeps each frame's best score over the readings, so a reading
     that does not apply (a dark scene's black edge trimmed, bars that are part
     of the indexed frame) cannot push the right frame down."""
@@ -122,6 +148,11 @@ def query_sets(image: Image.Image) -> list[list[Image.Image]]:
     for reading in [image] if trimmed is image else [image, trimmed]:
         if parts := strips(reading):
             sets.append([reading, *parts])
+    if colour:
+        balanced = levels(image)
+        sets.append([balanced, *pieces(balanced)])
+    if finer:
+        sets.append([image, *grid(image)])
     return sets
 
 
@@ -216,11 +247,22 @@ def frame_vectors(engine: dict, frames: np.ndarray) -> np.ndarray:
     return out
 
 
+def scores(vectors: np.ndarray, queries: np.ndarray | list[np.ndarray]) -> np.ndarray:
+    """Exact score of each frame's [50, 128] vectors for queries (the whole
+    image first), or [readings, frames] for a list of readings. One matrix
+    product for all of them (a batched 3-D one per reading is ~4x slower)."""
+    readings = queries if isinstance(queries, list) else [queries]
+    views = np.concatenate(readings)
+    best = (vectors.reshape(-1, 128) @ views.T).reshape(len(vectors), 50, len(views)).max(axis=1)  # [f, q]
+    bounds = np.cumsum([0, *map(len, readings)])
+    out = np.stack([np.maximum(best[:, a] - WHOLE_HANDICAP, best[:, a:b].mean(axis=1))
+                    for a, b in zip(bounds, bounds[1:])])
+    return out if isinstance(queries, list) else out[0]
+
+
 def rescore(engine: dict, queries: np.ndarray, frames: np.ndarray) -> np.ndarray:
     """Exact score of each frame id for queries (the whole image first)."""
-    vectors = frame_vectors(engine, frames)                  # [f, 50, 128]
-    best = (vectors @ queries.T).max(axis=1)                 # [f, q] best view per query image
-    return np.maximum(best[:, 0] - WHOLE_HANDICAP, best.mean(axis=1))
+    return scores(frame_vectors(engine, frames), queries)
 
 
 def neighbours(engine: dict, frames: np.ndarray, reach: int = NEIGHBOURS) -> np.ndarray:
@@ -235,23 +277,22 @@ def candidate_frames(engine: dict, queries: np.ndarray | list[np.ndarray],
                      count: int = CANDIDATES) -> tuple[np.ndarray, np.ndarray]:
     """(frame ids, exact scores): the frames of the count FAISS tiles per
     query image, plus the neighbours of the best NEIGHBOUR_TOP of them. Given
-    several readings of a query (query_sets), each frame keeps its best score."""
-    if isinstance(queries, list):
-        found = [candidate_frames(engine, np.ascontiguousarray(q, dtype=np.float32), count) for q in queries]
-        frames = np.unique(np.concatenate([f for f, _ in found]))
-        score = np.full(len(frames), -np.inf, dtype=np.float32)
-        for f, s in found:
-            at = np.searchsorted(frames, f)
-            score[at] = np.maximum(score[at], s)
-        return frames, score
-    _, ids = engine["index"].search(queries, count)
+    several readings of a query (query_sets), every candidate is scored for
+    every reading and keeps its best score; the neighbours are those of each
+    reading's best. The readings share most candidates, so each frame's
+    vectors are read once (~2x faster than a search per reading, 4 readings)."""
+    readings = queries if isinstance(queries, list) else [queries]
+    readings = [np.ascontiguousarray(q, dtype=np.float32) for q in readings]
+    _, ids = engine["index"].search(np.concatenate(readings), count)  # one batch for all views
     frames = np.unique(ids[ids >= 0] // engine["stride"])
     if len(frames) == 0:
         return frames, np.empty(0, dtype=np.float32)
-    score = rescore(engine, queries, frames)
-    best = frames[np.argsort(-score)[:NEIGHBOUR_TOP]]
+
+    each = scores(frame_vectors(engine, frames), readings)  # [readings, frames]
+    best = np.unique(frames[np.argsort(-each, axis=1)[:, :NEIGHBOUR_TOP]])
     extra = np.setdiff1d(neighbours(engine, best), frames)
-    return np.concatenate([frames, extra]), np.concatenate([score, rescore(engine, queries, extra)])
+    return (np.concatenate([frames, extra]),
+            np.concatenate([each.max(axis=0), scores(frame_vectors(engine, extra), readings).max(axis=0)]))
 
 
 def search(engine: dict, queries: np.ndarray | list[np.ndarray], candidates: int = CANDIDATES,

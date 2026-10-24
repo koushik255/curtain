@@ -10,7 +10,7 @@ import operator
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor
-from functools import lru_cache
+from functools import lru_cache, partial
 from pathlib import Path
 from collections.abc import Iterator, Sequence
 
@@ -46,7 +46,10 @@ TIMESTAMP_RECORDS = {
 # Below this, the best match is shown with a low-confidence note. On the crop
 # benchmark it flags ~45% of wrong-movie answers and ~11% of right ones.
 WEAK_SCORE = 0.70
-RESULTS = 5
+# Shown on the page: the aligned candidates (confirmed first), then the rest
+# in search order. On the 63-film benchmark the right frame is in the top 20
+# more often than first, so a near miss is still a scroll away.
+RESULTS = 20
 # The best frames are checked with SIFT alignment and the confirmed ones moved
 # to the front (validation suite: exact frame 62 -> 76 of 110 with 10). The
 # first ALIGN_FIRST go at once; only if none is confirmed are the rest of the
@@ -194,15 +197,19 @@ class TrainedSearchEngine:
         # The whole query plus four overlapping pieces (a crop that covers only
         # part of a frame still matches that frame's tiles piece by piece), and
         # where they apply the query with letterbox bars trimmed and a sliver as
-        # frame-shaped strips; each is one reading, embedded in one batch.
+        # frame-shaped strips, then with auto levels and with a 3x3 grid of
+        # pieces; each is one reading, embedded in one batch.
         sets = tile_search.query_sets(image)
         views = [view for reading in sets for view in reading]
-        tensor = torch.stack([self.transform(view) for view in views]).to(self.device)
+        unique = {id(view): view for view in views}  # the upload itself is in several readings
+        tensor = torch.stack([self.transform(view) for view in unique.values()]).to(self.device)
         decoded = time.perf_counter()
         yield {"type": "stage", "stage": "decoded", "elapsed_ms": (decoded - started) * 1000}
 
         with torch.inference_mode():
             queries = normalize_rows(self.model(tensor).float().cpu().numpy())
+        row = {key: i for i, key in enumerate(unique)}
+        queries = queries[[row[id(view)] for view in views]]
         embedded = time.perf_counter()
         yield {
             "type": "stage",
@@ -216,8 +223,12 @@ class TrainedSearchEngine:
         found = tile_search.search(self.search_index, readings, top=ALIGN_CANDIDATES)
         searched = time.perf_counter()
 
-        alignments = self.align_candidates(image, found)
-        order = align.rerank(found[:len(alignments)], alignments)[:RESULTS]
+        query = align.features(np.asarray(image.convert("L")))
+        alignments = self.align_candidates(query, found)
+        order = align.rerank(found[:len(alignments)], alignments)
+        order += range(len(alignments), len(found))
+        ranked = self.refine(query, [(*found[i], alignments[i] if i < len(alignments) else None) for i in order],
+                             readings)[:RESULTS]
         finished = time.perf_counter()
         yield {
             "type": "progress",
@@ -228,7 +239,7 @@ class TrainedSearchEngine:
             "retrieval_ms": (searched - embedded) * 1000,
             "frames_per_second": len(self.records) / (searched - embedded),
         }
-        results = [self.public_result(*found[i], alignments[i], image.size) for i in order]
+        results = [self.public_result(*entry, image.size) for entry in ranked]
         top = results[0] if results else None
         yield {
             "type": "result",
@@ -245,23 +256,46 @@ class TrainedSearchEngine:
             },
         }
 
-    def align_candidates(self, image: Image.Image, found: list[tuple[int, float]],
-                         first: int = ALIGN_FIRST) -> list[tuple]:
-        # Where the upload sits in each candidate, for the first `first`, then
-        # the rest of found if none of those is confirmed. One entry per
-        # candidate checked: (agreeing points, matrix or None, frame size).
-        query = align.features(np.asarray(image.convert("L")))
+    def locate(self, query: align.Features, index: int) -> tuple:
+        # Where the upload sits in a frame: (agreeing points, matrix or None, frame size).
+        path = self.frame_path(index)
+        if path is None:
+            return 0, None, (0, 0)
+        frame = align.frame_features(path)
+        return (*align.align(query, frame), frame.size)
 
-        def locate(index: int):
-            path = self.frame_path(index)
-            if path is None:
-                return 0, None, (0, 0)
-            frame = align.frame_features(path)
-            return (*align.align(query, frame), frame.size)
-        alignments = list(align_pool.map(locate, [index for index, _ in found[:first]]))
+    def align_candidates(self, query: align.Features, found: list[tuple[int, float]],
+                         first: int = ALIGN_FIRST) -> list[tuple]:
+        # locate() for the first `first` candidates, then the rest of found if
+        # none of those is confirmed; one entry per candidate checked.
+        alignments = list(align_pool.map(partial(self.locate, query), [index for index, _ in found[:first]]))
         if not any(a[0] >= align.VERIFIED_POINTS for a in alignments):
-            alignments += align_pool.map(locate, [index for index, _ in found[first:]])
+            alignments += align_pool.map(partial(self.locate, query), [index for index, _ in found[first:]])
         return alignments
+
+    def refine(self, query: align.Features, ranked: list[tuple], readings: list[np.ndarray]) -> list[tuple]:
+        # ranked: (frame, score, alignment or None), best first. A confirmed
+        # first frame is the right shot, but at 2 fps its neighbours look
+        # nearly the same and FAISS often puts one of them first: align the
+        # frames within NEIGHBOURS either side and put the one with the most
+        # agreeing points first (exact frame 348 -> 352 and 401 -> 402 of 470,
+        # benchmark_ideas.py). New neighbours get their best score over the readings.
+        if not ranked or not ranked[0][2] or ranked[0][2][0] < align.VERIFIED_POINTS:
+            return ranked
+        first = ranked[0][0]
+        known = {entry[0]: entry for entry in ranked}
+        near = [int(f) for f in tile_search.neighbours(self.search_index, np.array([first]))]
+        todo = [f for f in near if f not in known or known[f][2] is None]
+        new = [f for f in todo if f not in known]
+        scores = {}
+        if new:
+            vectors = tile_search.frame_vectors(self.search_index, np.array(new))
+            best = tile_search.scores(vectors, readings).max(axis=0)
+            scores = dict(zip(new, best.tolist()))
+        for f, alignment in zip(todo, align_pool.map(partial(self.locate, query), todo)):
+            known[f] = (f, known[f][1] if f in known else scores[f], alignment)
+        best = max(near, key=lambda f: (known[f][2][0], f == first))
+        return [known[best]] + [entry for entry in ranked if entry[0] != best]
 
     def frame_index(self, name: str) -> int | None:
         # Row of "<collection>/<movie>/<frame>.jpg"; each span is sorted by filename.

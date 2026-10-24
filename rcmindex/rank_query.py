@@ -140,7 +140,7 @@ def main() -> None:
     if args.align:
         found = [(int(f), float(s)) for f, s in zip(ranked[:ALIGN_CANDIDATES], ranked_score[:ALIGN_CANDIDATES])]
         t = time.perf_counter()
-        alignments = engine.align_candidates(image, found)
+        alignments = engine.align_candidates(align.features(np.asarray(image.convert("L"))), found)
         elapsed = (time.perf_counter() - t) * 1000
         print(f"\nalignment: {len(alignments)} of {len(found)} checked in {elapsed:.0f} ms")
         for i in align.rerank(found[:len(alignments)], alignments)[:args.top]:

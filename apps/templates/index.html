@@ -55,6 +55,7 @@
       #results figure[aria-current="true"] img { outline: 3px solid #2fbf71; }
       #results figcaption { font-size: 14px; color: var(--text); }
       #results figure:hover img { opacity: 0.85; }
+      #results figure.more img { width: 120px; }  /* past the first 5 */
     </style>
   </head>
   <body>
@@ -457,6 +458,7 @@
         results.replaceChildren();
         matches.forEach((match, rank) => {
           const card = document.createElement("figure");
+          if (rank >= 5) card.className = "more";
           card.tabIndex = 0;
           const image = document.createElement("img");
           image.src = match.thumbnail;
