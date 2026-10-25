@@ -64,6 +64,7 @@ class GpuTrainingConfig:
     # batch, so the loss must tell neighbouring frames apart. 0: off.
     neighbours: int = 0
     hard: bool = False  # GpuCombinedAugmenter(hard=True): reshaped tiles, overlays, grain
+    tight: bool = False  # with hard: smaller, thinner reshaped tiles, more of them
 
     def __post_init__(self):
         if self.global_loss_weight < 0 or self.local_loss_weight < 0:
@@ -221,7 +222,7 @@ def train(config: GpuTrainingConfig) -> dict[str, float]:
 
     device = torch.device("cuda")
     train_loader, evaluation_loaders = _loaders(config, train_paths, eval_paths)
-    augmenter = GpuCombinedAugmenter(config.image_size, config.grid_size, config.hard)
+    augmenter = GpuCombinedAugmenter(config.image_size, config.grid_size, config.hard, config.tight)
     model = CurtainEncoder(config.embedding_dim, config.image_size)
     if config.init:
         model.load_state_dict(torch.load(config.init, map_location="cpu", weights_only=False)["model"])
@@ -417,6 +418,7 @@ def parse_args() -> GpuTrainingConfig:
     parser.add_argument("--neighbours", type=int, default=0,
                         help="pair each frame with one up to this many frames later (hard negatives)")
     parser.add_argument("--hard", action="store_true", help="reshaped tiles, overlays, grain")
+    parser.add_argument("--tight", action="store_true", help="with --hard: smaller, thinner tiles")
     parser.add_argument("--eval-movies", type=int, default=6)
     args = parser.parse_args()
     return GpuTrainingConfig(
@@ -434,6 +436,7 @@ def parse_args() -> GpuTrainingConfig:
         accumulate=args.accumulate,
         neighbours=args.neighbours,
         hard=args.hard,
+        tight=args.tight,
         eval_movies=args.eval_movies,
     )
 

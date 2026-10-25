@@ -61,10 +61,15 @@ class GpuCombinedAugmenter:
     local positives of other sizes and shapes (0.6-1.4x a tile, aspect 0.7-1.4,
     for tight crops and slivers), subtitles/logos/UI bars on the query-side
     views (global crop and shifted tile), and film grain and sharpening.
+    tight=True (with hard) makes those reshaped positives three quarters of
+    them and smaller and thinner: 0.4-1.4x a tile, aspect 0.5-2. A tight crop
+    (20-35% of the frame) or its 60% corner pieces is 0.5-1.4 of an index tile;
+    with 0.6-1.4 tight crops found the exact frame 22 of 40 times.
     paired=True: the batch is (frame, neighbour) pairs; both get the same tile.
     """
 
-    def __init__(self, image_size: int = 192, grid_size: int = 4, hard: bool = False):
+    def __init__(self, image_size: int = 192, grid_size: int = 4, hard: bool = False,
+                 tight: bool = False):
         if image_size < 1:
             raise ValueError("Image size must be positive")
         if grid_size < 2:
@@ -72,6 +77,7 @@ class GpuCombinedAugmenter:
         self.image_size = image_size
         self.grid_size = grid_size
         self.hard = hard
+        self.tight = tight
         self.bank = _text_bank(image_size) if hard else None
 
     @staticmethod
@@ -182,9 +188,12 @@ class GpuCombinedAugmenter:
         if self.hard:
             # A tight crop or a sliver's strip is rarely exactly a tile: half
             # the positives are 0.6-1.4x a tile, with aspect 0.7-1.4.
-            reshape = torch.rand(count, device=device) < 0.5
-            scale = torch.where(reshape, self._uniform(count, 0.6, 1.4, device), 1.0)
-            aspect = torch.where(reshape, self._uniform(count, 0.7, 1.4, device).sqrt(), 1.0)
+            share, smallest, (thinnest, widest) = (0.75, 0.4, (0.5, 2.0)) if self.tight else (0.5, 0.6, (0.7, 1.4))
+            reshape = torch.rand(count, device=device) < share
+            scale = torch.where(reshape, self._uniform(count, smallest, 1.4, device), 1.0)
+            # Aspect drawn in log space, so tall and wide strips are as likely.
+            aspect = self._uniform(count, numpy.log(thinnest), numpy.log(widest), device).exp()
+            aspect = torch.where(reshape, aspect.sqrt(), 1.0)
             crop_widths = (tile_widths * scale * aspect).minimum(widths)
             crop_heights = (tile_heights * scale / aspect).minimum(heights)
         # Same centre as the cell, then shifted.

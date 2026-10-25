@@ -61,7 +61,10 @@ def index_batch(name: str, movies: list[str], model: str) -> int:
     for movie in movies:
         target = work / "frames" / movie
         target.mkdir(parents=True)
-        with tarfile.open(f"/vol/frames/{movie}.tar") as tar:
+        tar_path = Path(f"/vol/frames/{movie}.tar")
+        if not tar_path.exists():  # a validation film compare_models_modal.py uploaded
+            tar_path = Path(f"/vol/bench/{movie.split('/')[1]}.tar")
+        with tarfile.open(tar_path) as tar:
             tar.extractall(target, filter="data")
     # rcmindex caches its TensorRT engine beside the model, so a local copy.
     shutil.copytree(f"/vol/model/{model}", work / "model")
@@ -105,6 +108,7 @@ def main() -> None:
         except (modal.exception.NotFoundError, FileNotFoundError):
             return []
     uploaded = {e.path.removeprefix("frames/") for e in listing("frames") if e.path.endswith(".tar")}
+    uploaded |= {"full-curtain/" + e.path.removeprefix("bench/") for e in listing("bench") if e.path.endswith(".tar")}
     model = args.model.name
     if not listing(f"model/{model}"):
         with volume.batch_upload(force=True) as batch:

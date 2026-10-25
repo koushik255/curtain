@@ -7,8 +7,12 @@ anchors per film, each with a frame 1..--neighbours later (hard negatives,
 see GpuTrainingConfig.neighbours), unpacks just those to local disk and runs
 curtain_ml.gpu_training on an A100 with the hard augmentations. The run goes
 to the volume (runs/<name>/); --download copies it into curtain_models/<name>.
+--init picks the checkpoint it fine-tunes from (curtain_models/<init>/best.pt,
+uploaded once); --tight trains on smaller, thinner tile crops.
 
     .venv/bin/python -m modal run --detach curtain_ml/train_modal.py --name all-films-v1
+    .venv/bin/python -m modal run --detach curtain_ml/train_modal.py --name tight-v1 \\
+        --init all-films-v1 --tight --frames 1500 --epochs 4 --accumulate 4
     .venv/bin/python -m modal run curtain_ml/train_modal.py --name all-films-v1 --download
 """
 
@@ -20,7 +24,6 @@ import modal
 
 ROOT = Path(__file__).resolve().parents[1]
 VOLUME = "curtain-reindex"
-INIT = "colour-ft-v1"  # curtain_models/<INIT>/best.pt, fine-tuned from
 
 app = modal.App("curtain-train")
 volume = modal.Volume.from_name(VOLUME)
@@ -31,10 +34,11 @@ image = (
 )
 
 
-@app.function(image=image, gpu="A100-80GB", cpu=16, memory=65536, timeout=6 * 60 * 60,
+@app.function(image=image, gpu="A100-80GB", cpu=24, memory=65536, timeout=6 * 60 * 60,
               volumes={"/vol": volume})
 def train_all(name: str, frames: int, reach: int, epochs: int, limit: int | None,
-              batch_size: int, accumulate: int, learning_rate: float) -> dict:
+              batch_size: int, accumulate: int, learning_rate: float, init: str,
+              tight: bool) -> dict:
     import io
     import random
     import tarfile
@@ -69,9 +73,9 @@ def train_all(name: str, frames: int, reach: int, epochs: int, limit: int | None
     output = Path("/vol/runs") / name
     config = GpuTrainingConfig(
         data_dir=str(data), output_dir=str(output), epochs=epochs, batch_size=batch_size,
-        learning_rate=learning_rate, workers=14, limit=limit, forward_chunk_size=1024,
-        evaluation_interval=2, init=f"/vol/models/{INIT}/best.pt", accumulate=accumulate,
-        neighbours=reach, hard=True,
+        learning_rate=learning_rate, workers=22, limit=limit, forward_chunk_size=1024,
+        evaluation_interval=2, init=f"/vol/models/{init}/best.pt", accumulate=accumulate,
+        neighbours=reach, hard=True, tight=tight,
     )
     metrics = train(config)
     volume.commit()
@@ -81,7 +85,7 @@ def train_all(name: str, frames: int, reach: int, epochs: int, limit: int | None
 @app.local_entrypoint()
 def main(name: str, frames: int = 500, neighbours: int = 3, epochs: int = 6, limit: int = 0,
          batch_size: int = 256, accumulate: int = 2, learning_rate: float = 1e-4,
-         download: bool = False) -> None:
+         init: str = "colour-ft-v1", tight: bool = False, download: bool = False) -> None:
     if download:
         target = ROOT / "curtain_models" / name
         target.mkdir(parents=True, exist_ok=True)
@@ -92,9 +96,9 @@ def main(name: str, frames: int = 500, neighbours: int = 3, epochs: int = 6, lim
         print(f"downloaded runs/{name} to {target}")
         return
     try:
-        volume.listdir(f"models/{INIT}")
+        volume.listdir(f"models/{init}")
     except (modal.exception.NotFoundError, FileNotFoundError):
         with volume.batch_upload() as batch:
-            batch.put_file(str(ROOT / "curtain_models" / INIT / "best.pt"), f"/models/{INIT}/best.pt")
+            batch.put_file(str(ROOT / "curtain_models" / init / "best.pt"), f"/models/{init}/best.pt")
     print(train_all.remote(name, frames, neighbours, epochs, limit or None, batch_size, accumulate,
-                           learning_rate))
+                           learning_rate, init, tight))
