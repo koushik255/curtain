@@ -14,8 +14,8 @@ already on the volume are not uploaded again. The local frames are never
 touched. Afterwards delete the volume (modal volume delete curtain-reindex)
 and build an index from --out with build_faiss.py --runs.
 
-    nohup .venv/bin/python -m rcmindex.reindex_modal --model curtain_models/colour-ft-v1-onnx \\
-        --out .local/rcmindex-runs-colour-ft-v1 > .local/reindex-modal.log 2>&1 &
+    nohup .venv/bin/python -m rcmindex.reindex_modal --model curtain_models/tight-v1-onnx \\
+        --out .local/rcmindex-runs-tight-v1 > .local/reindex-modal.log 2>&1 &
 """
 
 from __future__ import annotations
@@ -33,7 +33,7 @@ from pathlib import Path
 import modal
 
 ROOT = Path(__file__).resolve().parents[1]
-VOLUME = "curtain-reindex"  # frames/<collection>/<movie>.tar, model/, out/<batch>/
+VOLUME = "curtain-reindex"  # frames/<collection>/<movie>.tar, model/, out/<model>/<batch>/
 UPLOADS = 4  # movies uploading at once
 
 app = modal.App("curtain-reindex")
@@ -52,7 +52,7 @@ image = (
 @app.function(image=image, gpu="L4", cpu=8, memory=32768, timeout=2 * 60 * 60,
               volumes={"/vol": volume}, retries=1)
 def index_batch(name: str, movies: list[str], model: str) -> int:
-    """Index movies ("<collection>/<movie>") into /vol/out/<name>; returns frames indexed."""
+    """Index movies ("<collection>/<movie>") into /vol/out/<model>/<name>; returns frames indexed."""
     import shutil
 
     volume.reload()
@@ -73,7 +73,7 @@ def index_batch(name: str, movies: list[str], model: str) -> int:
     subprocess.run(["/rcmindex/build/rcmindex", "--model", str(work / "model"), "--movies-from", "-",
                     "--global", "--output", str(out)], input=dirs, text=True, check=True,
                    stdout=subprocess.DEVNULL)
-    shutil.copytree(out, f"/vol/out/{name}", dirs_exist_ok=True)
+    shutil.copytree(out, f"/vol/out/{model}/{name}", dirs_exist_ok=True)
     volume.commit()
     return sum(json.loads(p.read_text())["frames"] for p in out.glob("*/*.json")
                if not p.name.endswith(".records.json"))
@@ -132,10 +132,10 @@ def main() -> None:
     def download(name: str, call: modal.FunctionCall) -> None:
         frames = call.get()
         local = args.out / name
-        for entry in volume.listdir(f"out/{name}", recursive=True):
+        for entry in volume.listdir(f"out/{model}/{name}", recursive=True):
             if entry.type != modal.volume.FileEntryType.FILE:
                 continue
-            path = local / entry.path.removeprefix(f"out/{name}/")
+            path = local / entry.path.removeprefix(f"out/{model}/{name}/")
             path.parent.mkdir(parents=True, exist_ok=True)
             with open(path.with_suffix(path.suffix + ".part"), "wb") as f:
                 for chunk in volume.read_file(entry.path):
