@@ -22,11 +22,19 @@ exactly those images and saves a JSON + Markdown report.
 encodings of curtain_ml.encodings instead (streams, rips, GIFs, image sites,
 re-upload chains), each made from the target and its neighbouring frames.
 
+`--suite stacked` goes through the steps a web screenshot does, in order:
+maybe another release's grade, maybe a stream or rip, the screenshot itself
+(the type: a crop, letterbox, subtitles, a phone photo), maybe an image
+site. Featureless queries (black, flat) are drawn again. Its report adds
+"same shot" and splits same-moment by stream and by site.
+
     .venv/bin/python -m rcmindex.validation_suite make --per-type 10
     .venv/bin/python -m rcmindex.validation_suite run
     .venv/bin/python -m rcmindex.validation_suite run --systems now
     .venv/bin/python -m rcmindex.validation_suite make --suite encodings --per-type 12
     .venv/bin/python -m rcmindex.validation_suite run --suite encodings
+    .venv/bin/python -m rcmindex.validation_suite make --suite stacked --per-type 50
+    .venv/bin/python -m rcmindex.validation_suite run --suite stacked --systems site
 """
 
 from __future__ import annotations
@@ -44,13 +52,15 @@ import torch
 from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont
 
 from curtain_ml import encodings
+from rcmindex import shots
 from curtain_ml.model import CurtainEncoder
 from curtain_ml.training import reference_transform
 
 ROOT = Path(__file__).resolve().parents[1]
 LOCAL = ROOT / ".local"
 SUITE = LOCAL / "benchmarks/validation-v1"
-SUITES = {"validation": SUITE, "encodings": LOCAL / "benchmarks/encodings-v1"}
+SUITES = {"validation": SUITE, "encodings": LOCAL / "benchmarks/encodings-v1",
+          "stacked": LOCAL / "benchmarks/stacked-v1"}
 NEIGHBOURS = 4  # frames either side of the target in an encodings clip
 RESULTS = LOCAL / "benchmarks/results"
 SOURCES = {"full-curtain": LOCAL / "screenshots", "l4-50k-lbfive": Path.home() / "lbfive/screenshots"}
@@ -144,18 +154,79 @@ def _phone(frame: Image.Image, rng: random.Random) -> Image.Image:
     return Image.fromarray(np.clip(np.asarray(blurred, dtype=np.float32) + noise, 0, 255).astype(np.uint8))
 
 
+# The stacked suite, step by step. None: the step is skipped.
+REGRADE_CHANCE = 0.4  # another release's grade, on every type but "regrade" (always)
+STREAMS = ["stream_h264", "stream_hevc", "stream_av1_grain", "youtube_vp9", "dvd_mpeg2", None]
+SITES = ["twitter", "reddit_preview", "whatsapp", None]
+SCREENSHOTS = {
+    "wide_crop": lambda f, r: crop(f, r, (0.7, 0.9), (0.7, 0.9)),
+    "medium_crop": lambda f, r: crop(f, r, (0.4, 0.65), (0.4, 0.65)),
+    "tight_crop": lambda f, r: crop(f, r, (0.2, 0.35), (0.2, 0.35)),
+    "regrade": lambda f, r: f,
+    "letterbox": lambda f, r: _player(f, r),
+    "subtitles": lambda f, r: subtitle(crop(f, r, (0.4, 0.65), (0.4, 0.65)), r),
+    "phone_photo": lambda f, r: _phone(f, r),
+}
+
+
+def _player(frame: Image.Image, rng: random.Random) -> Image.Image:
+    # The frame fitted into a screen of another shape, bars where it falls
+    # short (_letterbox adds no bars to a scope frame half the time).
+    screen = rng.choice([16 / 9, 16 / 10, 4 / 3])
+    w, h = frame.size
+    if w / h > screen:
+        canvas = Image.new("RGB", (w, round(w / screen)))
+    else:
+        canvas = Image.new("RGB", (round(h * screen), h))
+    if canvas.size == frame.size:  # same shape: a 16:9 player around a 21:9 frame instead
+        canvas = Image.new("RGB", (w, round(w * 9 / 16)))
+    canvas.paste(frame, ((canvas.width - w) // 2, (canvas.height - h) // 2))
+    return canvas
+
+
+def featureless(image: Image.Image) -> bool:
+    # Black or flat: no system could place it (a black frame, a crop of night sky).
+    gray = np.asarray(image.convert("L"), dtype=np.float32)
+    return gray.std() < 12 or np.percentile(gray, 95) < 40
+
+
+def stacked(kind: str, clip: list[Image.Image], rng: random.Random) -> tuple[Image.Image, dict]:
+    steps = {"regrade": kind == "regrade" or rng.random() < REGRADE_CHANCE,
+             "stream": rng.choice(STREAMS), "site": rng.choice(SITES)}
+    if steps["regrade"]:  # the same grade on every frame of the clip
+        grade = rng.random()
+        clip = [_regrade(f, random.Random(grade)) for f in clip]
+    frame = encodings.encode(steps["stream"], clip, NEIGHBOURS, rng) if steps["stream"] else clip[NEIGHBOURS]
+    query = SCREENSHOTS[kind](frame, rng)
+    if featureless(query):
+        return None, steps
+    if steps["site"]:
+        query = encodings.encode(steps["site"], [query], 0, rng)
+    return query, steps
+
+
 def make(per_type: int, seed: int, suite: str) -> None:
     rng = random.Random(seed)
     folder = SUITES[suite]
     folder.mkdir(parents=True, exist_ok=True)
     frames = {m: sorted((SOURCES["full-curtain"] / m).glob("*.jpg")) for m in VALIDATION}
-    types = encodings.RECIPES if suite == "encodings" else QUERY_TYPES
+    types = {"encodings": encodings.RECIPES, "stacked": SCREENSHOTS}.get(suite, QUERY_TYPES)
     manifest = []
     for kind, build in types.items():
         (folder / kind).mkdir(exist_ok=True)
         for n in range(per_type):
             movie = VALIDATION[n % len(VALIDATION)]  # spread evenly over the movies
-            if suite == "encodings":  # keep the codec's output exactly: PNG
+            steps = None
+            if suite == "stacked":
+                query = None
+                while query is None:
+                    at = rng.randrange(NEIGHBOURS, len(frames[movie]) - NEIGHBOURS)
+                    source = frames[movie][at]
+                    clip = [Image.open(p).convert("RGB") for p in frames[movie][at - NEIGHBOURS:at + NEIGHBOURS + 1]]
+                    query, steps = stacked(kind, clip, rng)
+                path = folder / kind / f"{n:02d}.png"
+                query.save(path)
+            elif suite == "encodings":  # keep the codec's output exactly: PNG
                 at = rng.randrange(NEIGHBOURS, len(frames[movie]) - NEIGHBOURS)
                 source = frames[movie][at]
                 clip = [Image.open(p).convert("RGB") for p in frames[movie][at - NEIGHBOURS:at + NEIGHBOURS + 1]]
@@ -168,7 +239,7 @@ def make(per_type: int, seed: int, suite: str) -> None:
                 path = folder / kind / f"{n:02d}.jpg"
                 query.save(path, quality=95)
             manifest.append({"type": kind, "image": str(path.relative_to(folder)),
-                             "target": f"full-curtain/{movie}/{source.name}"})
+                             "target": f"full-curtain/{movie}/{source.name}", **({"steps": steps} if steps else {})})
     (folder / "manifest.json").write_text(json.dumps({"seed": seed, "per_type": per_type,
                                                       "movies": VALIDATION, "queries": manifest}, indent=1))
     print(f"wrote {len(manifest)} queries ({per_type} x {len(types)} types) to {folder}")
@@ -286,8 +357,26 @@ def timestamps() -> dict[str, float]:
     return out
 
 
-def score(found: list[str], target: str, times: dict[str, float]) -> dict[str, bool]:
+def shot_maps() -> dict[str, np.ndarray]:
+    # Shot number of each validation movie's frames (full-curtain copy), where mapped.
+    out = {}
+    for movie in VALIDATION:
+        count = len(list((SOURCES["full-curtain"] / movie).glob("*.jpg")))
+        if (shot := shots.load(f"full-curtain/{movie}", count)) is not None:
+            out[f"full-curtain/{movie}"] = shot
+    return out
+
+
+def score(found: list[str], target: str, times: dict[str, float],
+          maps: dict[str, np.ndarray] | None = None) -> dict[str, bool]:
     title = target.split("/")[1]
+
+    def same_shot(name: str) -> bool:  # same full-curtain shot, else the same moment
+        film = target.rsplit("/", 1)[0]
+        if maps and film in maps and name.rsplit("/", 1)[0] == film:
+            number = lambda n: int(n.rsplit("_", 1)[1].split(".")[0]) - 1
+            return bool(maps[film][number(name)] == maps[film][number(target)])
+        return same_moment(name)
 
     def same_moment(name: str) -> bool:  # either copy of a movie, within a second
         return (name.split("/")[1] == title and name in times and target in times
@@ -297,6 +386,7 @@ def score(found: list[str], target: str, times: dict[str, float]) -> dict[str, b
         "top5": target in found,
         "moment": bool(found) and same_moment(found[0]),
         "movie": bool(found) and found[0].split("/")[1] == title,
+        **({"shot": bool(found) and same_shot(found[0])} if maps is not None else {}),
     }
 
 
@@ -306,6 +396,7 @@ def run(selected: list[str], suite: str) -> None:
     queries = manifest["queries"]
     images = [Image.open(folder / q["image"]).convert("RGB") for q in queries]
     times = timestamps()
+    maps = shot_maps() if suite == "stacked" else None
     torch.set_num_threads(16)
     report = {"suite": str(folder), "queries": len(queries), "systems": {}}
     for key in selected:
@@ -320,14 +411,14 @@ def run(selected: list[str], suite: str) -> None:
             latencies.append(time.perf_counter() - t)
             found, extra = found if isinstance(found, tuple) else (found, {})
             rows.append({"type": query["type"], "image": query["image"], "found": found,
-                         **extra, **score(found, query["target"], times)})
+                         **({"steps": query["steps"]} if "steps" in query else {}), **extra, **score(found, query["target"], times, maps)})
         report["systems"][key] = {"label": label, "rows": rows,
                                   "median_ms": float(np.median(latencies) * 1000)}
         del system
 
     types = list(dict.fromkeys(q["type"] for q in queries))
     metrics = [("exact", "exact frame"), ("moment", "same moment (±1 s)"), ("top5", "exact in top 5"),
-               ("movie", "right movie")]
+               ("movie", "right movie")] + ([("shot", "same shot")] if maps is not None else [])
     lines = [f"# {suite.capitalize()} suite: {len(queries)} queries, {len(types)} types, "
              f"movies: {', '.join(m.replace('_', ' ') for m in manifest['movies'])}", ""]
     for metric, title in metrics:
@@ -339,6 +430,18 @@ def run(selected: list[str], suite: str) -> None:
                 rows = [r for r in report["systems"][k]["rows"] if kind in ("ALL", r["type"])]
                 cells.append(f"{sum(r[metric] for r in rows)}/{len(rows)}")
             lines.append(f"| {'**all**' if kind == 'ALL' else kind} | " + " | ".join(cells) + " |")
+        lines.append("")
+    for step in ["regrade", "stream", "site"] if "steps" in queries[0] else []:
+        values = list(dict.fromkeys(str(q["steps"][step]) for q in queries))
+        lines += [f"## same moment by {step}", "",
+                  f"| {step} | " + " | ".join(report["systems"][k]["label"] for k in selected) + " |",
+                  "|" + "---|" * (len(selected) + 1)]
+        for value in values:
+            cells = []
+            for k in selected:
+                rows = [r for r in report["systems"][k]["rows"] if str(r["steps"][step]) == value]
+                cells.append(f"{sum(r['moment'] for r in rows)}/{len(rows)}")
+            lines.append(f"| {value} | " + " | ".join(cells) + " |")
         lines.append("")
     lines += ["median search time: " + ", ".join(f"{report['systems'][k]['label']} "
                                                   f"{report['systems'][k]['median_ms']:.0f} ms" for k in selected)]
