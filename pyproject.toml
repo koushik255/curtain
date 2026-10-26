@@ -10,6 +10,7 @@ dependencies = [
     "numpy>=2.2,<3",
     "opencv-python-headless>=4.10,<5",
     "pillow>=11,<13",
+    "scenedetect>=0.6,<0.7",
     "torch>=2.8,<3",
     "torchvision>=0.23,<1",
 ]

@@ -23,6 +23,7 @@
       #preview { display: block; margin-top: 12px; border-radius: 6px; }
       .actions { display: flex; flex-wrap: wrap; gap: 6px 12px; align-items: center; margin: 14px 0; }
       #status, #timings { color: var(--muted); font-size: 14px; }
+      #shots-toggle { display: inline-flex; gap: 6px; align-items: center; font-size: 14px; cursor: pointer; }
       #tracker { font-size: 14px; }
       #weak-note { background: #fff7e6; border: 1px solid #f3d9a4; border-radius: 6px; padding: 8px 12px; }
       #movies-list { max-height: 55vh; overflow-y: auto; margin: 0; padding-left: 22px; }
@@ -87,6 +88,8 @@
         </label>
         <p class="actions">
           <button id="search-button" type="submit">Find the frame</button>
+          <label id="shots-toggle" title="One result per shot (a camera cut to the next), with its start and end time, instead of one per frame">
+            <input id="shots" type="checkbox" /> Group by shot</label>
           <span id="status">Connecting to the trained index…</span>
           <span id="timings"></span>
         </p>
@@ -98,7 +101,7 @@
       </form>
 
       <section id="results-area" hidden>
-        <h2>Closest matches</h2>
+        <h2 id="results-heading">Closest matches</h2>
         <p id="weak-note" hidden><strong>Low confidence:</strong> the top match could not be confirmed by feature matching and its similarity is under 0.70, so it may be from a different movie.</p>
         <p class="muted small">All matches, best first. Click one to see where your screenshot sits. Similarity is cosine similarity, not probability.</p>
         <div id="results" aria-live="polite"></div>
@@ -136,6 +139,11 @@
       const trackerTime = document.querySelector("#tracker-time");
       const trackerProgress = document.querySelector("#tracker-progress");
       const trackerDetail = document.querySelector("#tracker-detail");
+      const shotsBox = document.querySelector("#shots");
+      try { shotsBox.checked = localStorage.getItem("curtain-shots") === "1"; } catch {}
+      shotsBox.addEventListener("change", () => {
+        try { localStorage.setItem("curtain-shots", shotsBox.checked ? "1" : "0"); } catch {}
+      });
       let selectedFile = null;
       let previewUrl = null;
       const moviesMenu = document.querySelector("#movies-menu");
@@ -320,7 +328,7 @@
         }, 50);
         let reached = false;
         try {
-          const response = await fetch("/api/search-stream", {
+          const response = await fetch(shotsBox.checked ? "/api/search-stream?shots=1" : "/api/search-stream", {
             method: "POST",
             headers: { "Content-Type": upload.type || "application/octet-stream" },
             body: upload,
@@ -391,6 +399,8 @@
         } else if (event.type === "result") {
           trackerStage.textContent = "Search complete";
           trackerProgress.value = trackerProgress.max;
+          document.querySelector("#results-heading").textContent =
+            event.results.some(match => match.shot_frames) ? "Closest shots" : "Closest matches";
           renderResults(event.results);
           document.querySelector("#weak-note").hidden = !event.weak;
           status.textContent = event.results.length
@@ -404,6 +414,14 @@
         if (seconds == null) return "time unknown";
         const value = Math.round(seconds);
         return `${String(Math.floor(value / 3600)).padStart(2, "0")}:${String(Math.floor((value % 3600) / 60)).padStart(2, "0")}:${String(value % 60).padStart(2, "0")}`;
+      }
+
+      // "shot 01:02:14–01:02:19 (11 frames)" for a result found by shot.
+      function shotText(match) {
+        if (!match.shot_frames) return "";
+        const frames = `${match.shot_frames} frame${match.shot_frames === 1 ? "" : "s"}`;
+        return match.shot_start_seconds == null ? ` · shot of ${frames}`
+          : ` · shot ${clock(match.shot_start_seconds)}–${clock(match.shot_end_seconds)} (${frames})`;
       }
 
       // ---- match view: the upload shown on its spot in the matched frame ----
@@ -442,7 +460,7 @@
       function showMatch(match, figure) {
         shown = match;
         results.querySelectorAll("figure").forEach(f => f.setAttribute("aria-current", f === figure));
-        stageCaption.textContent = `${match.title} (${match.year}) · ${clock(match.timestamp_seconds)} · frame ${match.frame_number} · similarity ${match.score.toFixed(3)} · `
+        stageCaption.textContent = `${match.title} (${match.year})${shotText(match)} · ${match.shot_frames ? "best frame " : ""}${clock(match.timestamp_seconds)} · frame ${match.frame_number} · similarity ${match.score.toFixed(3)} · `
           + (match.matrix ? `${match.points} matching points${match.confirmed ? " (confirmed)" : ""}`
                           : "could not find where the screenshot sits in this frame");
         stageFrame.onload = placeStage;
@@ -465,7 +483,7 @@
           image.alt = `Match ${rank + 1}: indexed frame from ${match.title}`;
           image.width = 200;
           const caption = document.createElement("figcaption");
-          caption.textContent = `${rank + 1}. ${match.title} (${match.year}) · ${match.training_label} · ${clock(match.timestamp_seconds)} · frame ${match.frame_number} · similarity ${match.score.toFixed(3)}`
+          caption.textContent = `${rank + 1}. ${match.title} (${match.year}) · ${match.training_label}${shotText(match)} · ${clock(match.timestamp_seconds)} · frame ${match.frame_number} · similarity ${match.score.toFixed(3)}`
             + (match.confirmed ? ` · ✓ ${match.points} matching points` : "");
           const link = document.createElement("a");
           link.href = match.full_image;

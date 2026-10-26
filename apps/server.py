@@ -59,6 +59,12 @@ RESULTS = 20
 # Override with CURTAIN_ALIGN_CANDIDATES.
 ALIGN_FIRST = 10
 ALIGN_CANDIDATES = int(os.environ.get("CURTAIN_ALIGN_CANDIDATES", 40))
+# Search by shot (the page's toggle): the best SHOT_FRAMES frames, one per
+# shot (rcmindex.shots), so the results are ALIGN_CANDIDATES different shots
+# instead of runs of neighbouring frames. On The Godfather Part II (200
+# queries, no tight crops) the right shot came first in 191 vs the exact frame
+# in 162, and was among the top 5 shots in all 200.
+SHOT_FRAMES = 400
 align_pool = ThreadPoolExecutor(os.cpu_count() or 8)
 BENCHMARK_SUITE = LOCAL_ROOT / "benchmarks/validation-v1"
 BENCHMARK_RESULTS = LOCAL_ROOT / "benchmarks/results"
@@ -167,7 +173,7 @@ class TrainedSearchEngine:
 
     def public_result(self, index: int, score: float,
                       alignment: tuple[int, list[float] | None, tuple[int, int]] | None = None,
-                      query_size: tuple[int, int] | None = None) -> dict:
+                      query_size: tuple[int, int] | None = None, shots: bool = False) -> dict:
         # Convert an internal matrix row into the JSON shown by the web UI.
         record = dict(self.records[index])
         if alignment:
@@ -187,9 +193,14 @@ class TrainedSearchEngine:
                       image=url_for("frame_image", index=index, w=640),
                       thumbnail=url_for("frame_image", index=index, w=320),
                       full_image=url_for("frame_image", index=index))
+        if shots:
+            first, last = tile_search.shot_span(self.search_index, index)
+            record.update(shot_start_seconds=self.records[first]["timestamp_seconds"],
+                          shot_end_seconds=self.records[last]["timestamp_seconds"],
+                          shot_frames=last - first + 1)
         return record
 
-    def search_stream(self, data: bytes) -> Iterator[dict]:
+    def search_stream(self, data: bytes, shots: bool = False) -> Iterator[dict]:
         # Yield decode, embedding, search, and final-result events for one query.
         started = time.perf_counter()
         with Image.open(io.BytesIO(data)) as image:
@@ -220,7 +231,11 @@ class TrainedSearchEngine:
 
         bounds = np.cumsum([0, *map(len, sets)])
         readings = [queries[start:end] for start, end in zip(bounds, bounds[1:])]
-        found = tile_search.search(self.search_index, readings, top=ALIGN_CANDIDATES)
+        if shots:
+            found = tile_search.search(self.search_index, readings, top=SHOT_FRAMES)
+            found = tile_search.by_shot(self.search_index, found)[:ALIGN_CANDIDATES]
+        else:
+            found = tile_search.search(self.search_index, readings, top=ALIGN_CANDIDATES)
         searched = time.perf_counter()
 
         query = align.features(np.asarray(image.convert("L")))
@@ -228,7 +243,10 @@ class TrainedSearchEngine:
         order = align.rerank(found[:len(alignments)], alignments)
         order += range(len(alignments), len(found))
         ranked = self.refine(query, [(*found[i], alignments[i] if i < len(alignments) else None) for i in order],
-                             readings)[:RESULTS]
+                             readings)
+        if shots:  # refine may bring in a neighbour from a shot already listed
+            ranked = tile_search.by_shot(self.search_index, ranked)
+        ranked = ranked[:RESULTS]
         finished = time.perf_counter()
         yield {
             "type": "progress",
@@ -239,7 +257,7 @@ class TrainedSearchEngine:
             "retrieval_ms": (searched - embedded) * 1000,
             "frames_per_second": len(self.records) / (searched - embedded),
         }
-        results = [self.public_result(*entry, image.size) for entry in ranked]
+        results = [self.public_result(*entry, image.size, shots=shots) for entry in ranked]
         top = results[0] if results else None
         yield {
             "type": "result",
@@ -405,12 +423,13 @@ def search_stream():
     data = request.get_data()
     if not data:
         return jsonify(error="Choose, drop, or paste an image first."), 400
+    shots = request.args.get("shots") == "1"
 
     @stream_with_context
     def generate():
         # Keep the Flask request context while forwarding engine events.
         try:
-            for event in engine.search_stream(data):
+            for event in engine.search_stream(data, shots):
                 yield json.dumps(event, separators=(",", ":")) + "\n"
         except Image.DecompressionBombError:
             # Pillow refuses images over 2 x MAX_IMAGE_PIXELS (~179 MP) to protect memory.

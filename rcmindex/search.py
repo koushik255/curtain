@@ -21,6 +21,8 @@ import faiss
 import numpy as np
 from PIL import Image
 
+from rcmindex import shots
+
 # The index the site and benchmarks search; CURTAIN_FAISS_DIR picks another
 # (build_faiss.py --out), e.g. one built from a new model's arrays.
 FAISS_DIR = Path(os.environ.get("CURTAIN_FAISS_DIR", Path(__file__).resolve().parents[1] / ".local/faiss"))
@@ -211,6 +213,39 @@ class FrameNames(Sequence):
         return f"{self.movies[self.movie_of(index)]}/{self.filename(index)}"
 
 
+def shot_ids(movies: list[dict]) -> np.ndarray:
+    """Shot id of every frame id, ascending through the catalog (rcmindex.shots'
+    maps); a film without a map has one shot per frame."""
+    out = np.empty(sum(m["frames"] for m in movies), dtype=np.int32)
+    next_id = 0
+    for m in movies:
+        shot = shots.load(m["movie"], m["frames"])
+        if shot is None:
+            shot = np.arange(m["frames"], dtype=np.int32)
+        out[m["first"]:m["first"] + m["frames"]] = shot + next_id
+        next_id += int(shot[-1]) + 1
+    return out
+
+
+def shot_span(engine: dict, frame: int) -> tuple[int, int]:
+    """First and last frame id of the shot holding frame."""
+    shot = engine["shot"]
+    return (int(np.searchsorted(shot, shot[frame], side="left")),
+            int(np.searchsorted(shot, shot[frame], side="right")) - 1)
+
+
+def by_shot(engine: dict, ranked: list[tuple]) -> list[tuple]:
+    """ranked (entries whose first item is a frame id), keeping only the first of each shot."""
+    seen = set()
+    out = []
+    for entry in ranked:
+        shot = int(engine["shot"][entry[0]])
+        if shot not in seen:
+            seen.add(shot)
+            out.append(entry)
+    return out
+
+
 def load(directory: Path = FAISS_DIR, nprobe: int = 64) -> dict:
     catalog = json.loads((directory / "catalog.json").read_text())
     index = faiss.read_index(str(directory / INDEX_NAME), faiss.IO_FLAG_READ_ONLY)
@@ -218,6 +253,7 @@ def load(directory: Path = FAISS_DIR, nprobe: int = 64) -> dict:
     movies = catalog["movies"]
     names = FrameNames(movies, catalog.pop("names"))
     return {
+        "shot": shot_ids(movies),
         "index": index,
         "names": names,
         "movies": movies,
