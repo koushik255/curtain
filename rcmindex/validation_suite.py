@@ -18,9 +18,15 @@ eleven types, so systems can be compared per type:
 `make` writes the images and a manifest once; `run` evaluates systems on
 exactly those images and saves a JSON + Markdown report.
 
+`--suite encodings` builds a second suite whose types are the real-world
+encodings of curtain_ml.encodings instead (streams, rips, GIFs, image sites,
+re-upload chains), each made from the target and its neighbouring frames.
+
     .venv/bin/python -m rcmindex.validation_suite make --per-type 10
     .venv/bin/python -m rcmindex.validation_suite run
     .venv/bin/python -m rcmindex.validation_suite run --systems now
+    .venv/bin/python -m rcmindex.validation_suite make --suite encodings --per-type 12
+    .venv/bin/python -m rcmindex.validation_suite run --suite encodings
 """
 
 from __future__ import annotations
@@ -28,6 +34,7 @@ from __future__ import annotations
 import argparse
 import io
 import json
+import os
 import random
 import time
 from pathlib import Path
@@ -36,12 +43,15 @@ import numpy as np
 import torch
 from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont
 
+from curtain_ml import encodings
 from curtain_ml.model import CurtainEncoder
 from curtain_ml.training import reference_transform
 
 ROOT = Path(__file__).resolve().parents[1]
 LOCAL = ROOT / ".local"
 SUITE = LOCAL / "benchmarks/validation-v1"
+SUITES = {"validation": SUITE, "encodings": LOCAL / "benchmarks/encodings-v1"}
+NEIGHBOURS = 4  # frames either side of the target in an encodings clip
 RESULTS = LOCAL / "benchmarks/results"
 SOURCES = {"full-curtain": LOCAL / "screenshots", "l4-50k-lbfive": Path.home() / "lbfive/screenshots"}
 OLD_INDEXES = {"full-curtain": LOCAL / "trained_indexes/l4-50k-crop-v1",
@@ -134,25 +144,34 @@ def _phone(frame: Image.Image, rng: random.Random) -> Image.Image:
     return Image.fromarray(np.clip(np.asarray(blurred, dtype=np.float32) + noise, 0, 255).astype(np.uint8))
 
 
-def make(per_type: int, seed: int) -> None:
+def make(per_type: int, seed: int, suite: str) -> None:
     rng = random.Random(seed)
-    SUITE.mkdir(parents=True, exist_ok=True)
+    folder = SUITES[suite]
+    folder.mkdir(parents=True, exist_ok=True)
     frames = {m: sorted((SOURCES["full-curtain"] / m).glob("*.jpg")) for m in VALIDATION}
+    types = encodings.RECIPES if suite == "encodings" else QUERY_TYPES
     manifest = []
-    for kind, build in QUERY_TYPES.items():
-        (SUITE / kind).mkdir(exist_ok=True)
+    for kind, build in types.items():
+        (folder / kind).mkdir(exist_ok=True)
         for n in range(per_type):
             movie = VALIDATION[n % len(VALIDATION)]  # spread evenly over the movies
-            source = rng.choice(frames[movie])
-            with Image.open(source) as image:
-                query = build(image.convert("RGB"), rng)
-            path = SUITE / kind / f"{n:02d}.jpg"
-            query.save(path, quality=95)
-            manifest.append({"type": kind, "image": str(path.relative_to(SUITE)),
+            if suite == "encodings":  # keep the codec's output exactly: PNG
+                at = rng.randrange(NEIGHBOURS, len(frames[movie]) - NEIGHBOURS)
+                source = frames[movie][at]
+                clip = [Image.open(p).convert("RGB") for p in frames[movie][at - NEIGHBOURS:at + NEIGHBOURS + 1]]
+                query, path = build(clip, NEIGHBOURS, rng), folder / kind / f"{n:02d}.png"
+                query.save(path)
+            else:
+                source = rng.choice(frames[movie])
+                with Image.open(source) as image:
+                    query = build(image.convert("RGB"), rng)
+                path = folder / kind / f"{n:02d}.jpg"
+                query.save(path, quality=95)
+            manifest.append({"type": kind, "image": str(path.relative_to(folder)),
                              "target": f"full-curtain/{movie}/{source.name}"})
-    (SUITE / "manifest.json").write_text(json.dumps({"seed": seed, "per_type": per_type,
-                                                     "movies": VALIDATION, "queries": manifest}, indent=1))
-    print(f"wrote {len(manifest)} queries ({per_type} x {len(QUERY_TYPES)} types) to {SUITE}")
+    (folder / "manifest.json").write_text(json.dumps({"seed": seed, "per_type": per_type,
+                                                      "movies": VALIDATION, "queries": manifest}, indent=1))
+    print(f"wrote {len(manifest)} queries ({per_type} x {len(types)} types) to {folder}")
 
 
 # ------------------------------------------------------------------ systems
@@ -195,7 +214,9 @@ def system_now(pieces_on: bool = True, upload: bool = True, align_top: int = 0) 
     align_top, the best align_top frames are re-ordered by SIFT alignment."""
     from concurrent.futures import ThreadPoolExecutor
     from rcmindex import align, search
-    model = CurtainEncoder.from_checkpoint(LOCAL / "trained_models/combined-rocm-50k-v1/best.pt")
+    # The model must be the one whose arrays built the index (CURTAIN_FAISS_DIR).
+    model = CurtainEncoder.from_checkpoint(Path(os.environ.get(
+        "CURTAIN_CHECKPOINT", LOCAL / "trained_models/combined-rocm-50k-v1/best.pt")))
     engine = search.load()
     pool = ThreadPoolExecutor(8)
 
@@ -224,12 +245,30 @@ def system_now(pieces_on: bool = True, upload: bool = True, align_top: int = 0) 
     return run
 
 
+def system_site(shots: bool = False) -> callable:
+    """Exactly what the site runs (apps/server.py): every reading of the query,
+    FAISS, alignment, refinement within the shot; with shots, one result per
+    shot as the site's "group by shot" view shows them. Model and index as the
+    server picks them (CURTAIN_CHECKPOINT, CURTAIN_FAISS_DIR)."""
+    from apps.server import DEFAULT_CHECKPOINT, TrainedSearchEngine
+    engine = TrainedSearchEngine(DEFAULT_CHECKPOINT)
+    names = engine.search_index["names"]
+
+    def run(image: Image.Image) -> list[str]:
+        image = browser_upload(image)
+        ranked, _ = engine.rank(image, engine.embed_query(image), shots)
+        return [names[entry[0]] for entry in ranked[:TOP]]
+    return run
+
+
 SYSTEMS = {
     "before": ("before: crop-v1, whole frames", system_before),
     "now-nopieces": ("now without pieces", lambda: system_now(pieces_on=False)),
     "now": ("now: tiles + pieces", system_now),
     "now-align5": ("now + alignment, top 5", lambda: system_now(align_top=5)),
-    "now-align10": ("now + alignment (site)", lambda: system_now(align_top=10)),
+    "now-align10": ("now + alignment, top 10", lambda: system_now(align_top=10)),
+    "site": ("site", system_site),
+    "site-shots": ("site, by shot", lambda: system_site(shots=True)),
 }
 DEFAULT_SYSTEMS = ["before", "now", "now-align10"]
 
@@ -261,13 +300,14 @@ def score(found: list[str], target: str, times: dict[str, float]) -> dict[str, b
     }
 
 
-def run(selected: list[str]) -> None:
-    manifest = json.loads((SUITE / "manifest.json").read_text())
+def run(selected: list[str], suite: str) -> None:
+    folder = SUITES[suite]
+    manifest = json.loads((folder / "manifest.json").read_text())
     queries = manifest["queries"]
-    images = [Image.open(SUITE / q["image"]).convert("RGB") for q in queries]
+    images = [Image.open(folder / q["image"]).convert("RGB") for q in queries]
     times = timestamps()
     torch.set_num_threads(16)
-    report = {"suite": str(SUITE), "queries": len(queries), "systems": {}}
+    report = {"suite": str(folder), "queries": len(queries), "systems": {}}
     for key in selected:
         label, build = SYSTEMS[key]
         started = time.perf_counter()
@@ -288,7 +328,7 @@ def run(selected: list[str]) -> None:
     types = list(dict.fromkeys(q["type"] for q in queries))
     metrics = [("exact", "exact frame"), ("moment", "same moment (±1 s)"), ("top5", "exact in top 5"),
                ("movie", "right movie")]
-    lines = [f"# Validation suite: {len(queries)} queries, {len(types)} types, "
+    lines = [f"# {suite.capitalize()} suite: {len(queries)} queries, {len(types)} types, "
              f"movies: {', '.join(m.replace('_', ' ') for m in manifest['movies'])}", ""]
     for metric, title in metrics:
         header = "| type | " + " | ".join(report["systems"][k]["label"] for k in selected) + " |"
@@ -319,11 +359,13 @@ def main() -> None:
     m.add_argument("--seed", type=int, default=7)
     r = sub.add_parser("run")
     r.add_argument("--systems", nargs="+", default=DEFAULT_SYSTEMS, choices=list(SYSTEMS))
+    for p in (m, r):
+        p.add_argument("--suite", default="validation", choices=list(SUITES))
     args = parser.parse_args()
     if args.command == "make":
-        make(args.per_type, args.seed)
+        make(args.per_type, args.seed, args.suite)
     else:
-        run(args.systems)
+        run(args.systems, args.suite)
 
 
 if __name__ == "__main__":

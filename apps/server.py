@@ -205,22 +205,10 @@ class TrainedSearchEngine:
         started = time.perf_counter()
         with Image.open(io.BytesIO(data)) as image:
             image = ImageOps.exif_transpose(image).convert("RGB")
-        # The whole query plus four overlapping pieces (a crop that covers only
-        # part of a frame still matches that frame's tiles piece by piece), and
-        # where they apply the query with letterbox bars trimmed and a sliver as
-        # frame-shaped strips, then with auto levels and with a 3x3 grid of
-        # pieces; each is one reading, embedded in one batch.
-        sets = tile_search.query_sets(image)
-        views = [view for reading in sets for view in reading]
-        unique = {id(view): view for view in views}  # the upload itself is in several readings
-        tensor = torch.stack([self.transform(view) for view in unique.values()]).to(self.device)
         decoded = time.perf_counter()
         yield {"type": "stage", "stage": "decoded", "elapsed_ms": (decoded - started) * 1000}
 
-        with torch.inference_mode():
-            queries = normalize_rows(self.model(tensor).float().cpu().numpy())
-        row = {key: i for i, key in enumerate(unique)}
-        queries = queries[[row[id(view)] for view in views]]
+        readings = self.embed_query(image)
         embedded = time.perf_counter()
         yield {
             "type": "stage",
@@ -229,24 +217,7 @@ class TrainedSearchEngine:
             "embedding_ms": (embedded - decoded) * 1000,
         }
 
-        bounds = np.cumsum([0, *map(len, sets)])
-        readings = [queries[start:end] for start, end in zip(bounds, bounds[1:])]
-        if shots:
-            found = tile_search.search(self.search_index, readings, top=SHOT_FRAMES)
-            found = tile_search.by_shot(self.search_index, found)[:ALIGN_CANDIDATES]
-        else:
-            found = tile_search.search(self.search_index, readings, top=ALIGN_CANDIDATES)
-        searched = time.perf_counter()
-
-        query = align.features(np.asarray(image.convert("L")))
-        alignments = self.align_candidates(query, found)
-        order = align.rerank(found[:len(alignments)], alignments)
-        order += range(len(alignments), len(found))
-        ranked = self.refine(query, [(*found[i], alignments[i] if i < len(alignments) else None) for i in order],
-                             readings)
-        if shots:  # refine may bring in a neighbour from a shot already listed
-            ranked = tile_search.by_shot(self.search_index, ranked)
-        ranked = ranked[:RESULTS]
+        ranked, searched = self.rank(image, readings, shots)
         finished = time.perf_counter()
         yield {
             "type": "progress",
@@ -273,6 +244,43 @@ class TrainedSearchEngine:
                 "server_total_ms": (finished - started) * 1000,
             },
         }
+
+    def embed_query(self, image: Image.Image) -> list[np.ndarray]:
+        # The whole query plus four overlapping pieces (a crop that covers only
+        # part of a frame still matches that frame's tiles piece by piece), and
+        # where they apply the query with letterbox bars trimmed and a sliver as
+        # frame-shaped strips, then with auto levels and with a 3x3 grid of
+        # pieces; each is one reading, embedded in one batch.
+        sets = tile_search.query_sets(image)
+        views = [view for reading in sets for view in reading]
+        unique = {id(view): view for view in views}  # the upload itself is in several readings
+        tensor = torch.stack([self.transform(view) for view in unique.values()]).to(self.device)
+        with torch.inference_mode():
+            queries = normalize_rows(self.model(tensor).float().cpu().numpy())
+        row = {key: i for i, key in enumerate(unique)}
+        queries = queries[[row[id(view)] for view in views]]
+        bounds = np.cumsum([0, *map(len, sets)])
+        return [queries[start:end] for start, end in zip(bounds, bounds[1:])]
+
+    def rank(self, image: Image.Image, readings: list[np.ndarray], shots: bool = False) -> tuple[list[tuple], float]:
+        # The results, best first, as (frame, score, alignment or None), and
+        # when the FAISS search (before alignment) finished.
+        if shots:
+            found = tile_search.search(self.search_index, readings, top=SHOT_FRAMES)
+            found = tile_search.by_shot(self.search_index, found)[:ALIGN_CANDIDATES]
+        else:
+            found = tile_search.search(self.search_index, readings, top=ALIGN_CANDIDATES)
+        searched = time.perf_counter()
+
+        query = align.features(np.asarray(image.convert("L")))
+        alignments = self.align_candidates(query, found)
+        order = align.rerank(found[:len(alignments)], alignments)
+        order += range(len(alignments), len(found))
+        ranked = self.refine(query, [(*found[i], alignments[i] if i < len(alignments) else None) for i in order],
+                             readings)
+        if shots:  # refine may bring in a neighbour from a shot already listed
+            ranked = tile_search.by_shot(self.search_index, ranked)
+        return ranked[:RESULTS], searched
 
     def locate(self, query: align.Features, index: int) -> tuple:
         # Where the upload sits in a frame: (agreeing points, matrix or None, frame size).
