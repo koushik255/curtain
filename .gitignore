@@ -64,3 +64,11 @@ rcmindex/build/
 
 # curtain_lab experiment outputs (extracted frames, embedding caches, galleries)
 /curtain_lab/results/
+
+# Local-only: benchmark data, experiment reports and agent notes
+/benchmarks/data/
+/curtain_lab/*.md
+/docs/godfather-retrieval-diagnosis.md
+/docs/online-benchmark.md
+/docs/retrieval-test-plan.md
+/docs/web-screenshots.md
