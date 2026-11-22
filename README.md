@@ -76,7 +76,7 @@ with greyscale and stronger colour changes is the next step.
 curtain_ml/          Encoder, training and retrieval logic
 rcmindex/            C++/HIP tile indexer for AMD GPUs, FAISS search, alignment
 apps/                Search site
-benchmarks/          Retrieval robustness checks against the live index
+curtain_lab/         Film-similarity experiments (Kurosawa)
 deploy/              systemd unit for the site
 docs/                Training notes and README images
 ```

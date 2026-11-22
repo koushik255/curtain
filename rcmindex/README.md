@@ -128,9 +128,9 @@ Puts every frame's 49 tiles and whole-frame vector into one FAISS index in
 exactly from the memory-mapped fp16 arrays; `rcmindex.align` then locates the
 query inside the best frames with SIFT + RANSAC. The search site uses both.
 
-Benchmarks: `benchmark_crops` (brute force over the tile arrays),
-`benchmark_faiss` (the same queries through FAISS) and `validation_suite`
-(eleven query types from the validation movies, every search system).
+Benchmarks: `benchmark_crops` (brute force over the tile arrays) and
+`validation_suite` (eleven query types from the validation movies, every
+search system).
 
 Not done yet: int8, and hipGraph capture (MIGraphX programs can't be captured;
 the remaining launches are only the two resize passes and the pool kernels).

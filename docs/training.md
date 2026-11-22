@@ -65,8 +65,3 @@ normalized matrices in memory. For a query it:
 The live site uses CPU inference because it is a persistent local service;
 training and indexing need a GPU.
 
-Run the one retained robustness benchmark against the live artifacts with:
-
-```sh
-.venv/bin/python -m benchmarks.evaluate --condition crop --samples 100
-```
