@@ -65,6 +65,47 @@ def one_per_film(entries: list) -> list:
     return sorted(kept)
 
 
+def build_ondisk(trained, movies: list, total: int, out: Path, args) -> None:
+    """Add movies to copies of the trained empty index in shards of
+    --shard-movies, write each shard, then merge every shard's inverted lists
+    into one .ivfdata (OnDiskInvertedLists). Peak RAM is one shard, not the
+    whole index. Writes the same <name>.ondisk.faiss + <name>.ivfdata pair as
+    ondisk_faiss.py, which search.load() opens with IO_FLAG_READ_ONLY."""
+    from faiss.contrib.ondisk import merge_ondisk
+
+    from rcmindex.ondisk_faiss import ondisk_paths
+
+    name = out / f"tiles4-global-ivf{args.lists}-pq{args.pq}.faiss"
+    trained_path = out / "trained.faiss"
+    faiss.write_index(trained, str(trained_path))
+    shard_dir = out / "shards"
+    shard_dir.mkdir(exist_ok=True)
+    shards, added = [], 0
+    for s in range(0, len(movies), args.shard_movies):
+        path = shard_dir / f"shard-{s // args.shard_movies:03d}.faiss"
+        group = movies[s:s + args.shard_movies]
+        if not path.exists():  # resumable
+            index = faiss.read_index(str(trained_path))
+            for m in group:
+                tiles, whole = np.load(m["tiles"], mmap_mode="r"), np.load(m["global"], mmap_mode="r")
+                for start in range(0, m["frames"], 4096):
+                    x, ids = vectors(tiles, whole, m["first"], np.arange(start, min(start + 4096, m["frames"])))
+                    index.add_with_ids(x, ids)
+            faiss.write_index(index, str(path.with_suffix(".tmp")))
+            path.with_suffix(".tmp").rename(path)
+            del index
+        shards.append(str(path))
+        added += sum(m["frames"] for m in group) * 50
+        note(f"shard {len(shards)}: {s + len(group)}/{len(movies)} movies, {added:,}/{total:,} vectors")
+    index_path, ivfdata = ondisk_paths(name)
+    index = faiss.read_index(str(trained_path))
+    note(f"merging {len(shards)} shards into {ivfdata}")
+    merge_ondisk(index, shards, str(ivfdata))
+    faiss.write_index(index, str(index_path))
+    note(f"wrote {index_path} and {ivfdata} ({ivfdata.stat().st_size / 1e9:.1f} GB); "
+         f"delete {shard_dir} and {trained_path} once it checks out")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--lists", type=int, default=16384)
@@ -74,6 +115,10 @@ def main() -> None:
     # .local/faiss and the old arrays stay untouched until it switches.
     parser.add_argument("--runs", type=Path, default=RUNS, help="rcmindex run directories to index")
     parser.add_argument("--out", type=Path, default=OUT, help="where catalog.json and the index go")
+    parser.add_argument("--ondisk", action="store_true",
+                        help="add in shards of --shard-movies and merge straight into the on-disk index "
+                             "search.load() opens (no full in-RAM index; ondisk_faiss.py not needed)")
+    parser.add_argument("--shard-movies", type=int, default=40)
     args = parser.parse_args()
     out = args.out
     faiss.omp_set_num_threads(16)
@@ -103,6 +148,10 @@ def main() -> None:
     index.train(sample)
     del sample
     note("trained")
+
+    if args.ondisk:
+        build_ondisk(index, movies, total, out, args)
+        return
 
     added = 0
     for number, m in enumerate(movies, 1):

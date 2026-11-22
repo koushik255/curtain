@@ -457,7 +457,7 @@ def parse_args() -> TrainingConfig:
     parser = argparse.ArgumentParser(
         description="Train Curtain's contrastive frame encoder."
     )
-    parser.add_argument("--data", type=Path, default=Path(".local/selected_screenshots"))
+    parser.add_argument("--data", type=Path, default=Path(".local/data/training/selected_screenshots"))
     parser.add_argument("--output", type=Path, default=Path("training_runs/default"))
     parser.add_argument("--epochs", type=int, default=20)
     args = parser.parse_args()

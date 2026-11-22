@@ -30,6 +30,7 @@ from PIL import Image
 from curtain_ml.model import CurtainEncoder
 from curtain_ml.training import reference_transform
 from rcmindex.search import pieces
+from rcmindex.data_paths import ORIGINAL_DIRS
 
 ROOT = Path(__file__).resolve().parents[1]
 LOCAL = ROOT / ".local"
@@ -38,7 +39,7 @@ LIVE_INDEXES = {"full-curtain": LOCAL / "trained_indexes/l4-50k-crop-v1",
                 "l4-50k-lbfive": LOCAL / "trained_indexes/l4-50k-lbfive-crop-v1"}
 NEW_MODEL = LOCAL / "trained_models/combined-rocm-50k-v1/best.pt"
 RUNS = LOCAL / "rcmindex-runs"
-SOURCES = {"full-curtain": LOCAL / "screenshots", "l4-50k-lbfive": Path.home() / "lbfive/screenshots"}
+SOURCES = ORIGINAL_DIRS
 GRIDS = {"4": ".npy", "3": ".g3.npy", "2": ".g2.npy", "1": ".global.npy"}
 TOP = 5
 PIECES = 4

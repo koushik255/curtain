@@ -49,7 +49,7 @@ def rank_all(movies: list[str], checkpoints: list[str], items: bytes) -> dict[st
     for movie in movies:
         target = Path("/tmp/frames") / movie
         target.mkdir(parents=True)
-        with tarfile.open(fileobj=io.BytesIO(Path(f"/vol/bench/{movie}.tar").read_bytes())) as tar:
+        with tarfile.open(fileobj=io.BytesIO(Path(f"/vol/indexed_movies_fullres/full-curtain/{movie}.tar").read_bytes())) as tar:
             tar.extractall(target, filter="data")
         paths[movie] = sorted(target.glob("*.jpg"))
     queries = [(kind, Image.open(io.BytesIO(png)).convert("RGB"), target)
@@ -85,21 +85,21 @@ def main(checkpoints: str, extra: int = 30, seed: int = 11) -> None:
             return {e.path for e in volume.listdir(path, recursive=True)}
         except (modal.exception.NotFoundError, FileNotFoundError):
             return set()
-    there = listing("bench") | listing("models")
+    there = listing("indexed_movies_fullres/full-curtain") | listing("trained_models_pt")
     with volume.batch_upload(force=True) as batch:
         for movie in VALIDATION:
-            if f"bench/{movie}.tar" not in there:
+            if f"indexed_movies_fullres/full-curtain/{movie}.tar" not in there:
                 buffer = io.BytesIO()
                 with tarfile.open(fileobj=buffer, mode="w") as tar:
                     for path in sorted((SOURCES["full-curtain"] / movie).glob("*.jpg")):
                         tar.add(path, arcname=path.name)
                 buffer.seek(0)
-                batch.put_file(buffer, f"/bench/{movie}.tar")
+                batch.put_file(buffer, f"/indexed_movies_fullres/full-curtain/{movie}.tar")
                 print(f"queued {movie}", flush=True)
         names = []
         for checkpoint in checkpoints.split(","):
             path = Path(checkpoint)
-            name = f"models/{path.parent.name}/{path.name}"
+            name = f"trained_models_pt/{path.parent.name}/{path.name}"
             if name not in there:
                 batch.put_file(str(ROOT / path), "/" + name)
             names.append(name)

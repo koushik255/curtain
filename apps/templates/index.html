@@ -461,7 +461,8 @@
         shown = match;
         results.querySelectorAll("figure").forEach(f => f.setAttribute("aria-current", f === figure));
         stageCaption.textContent = `${match.title} (${match.year})${shotText(match)} · ${match.shot_frames ? "best frame " : ""}${clock(match.timestamp_seconds)} · frame ${match.frame_number} · similarity ${match.score.toFixed(3)} · `
-          + (match.matrix ? `${match.points} matching points${match.confirmed ? " (confirmed)" : ""}`
+          + (match.match === "scene" ? "same scene: the closest frame we have, not this exact moment"
+             : match.matrix ? `${match.points} matching points${match.confirmed ? " (confirmed)" : ""}`
                           : "could not find where the screenshot sits in this frame");
         stageFrame.onload = placeStage;
         stagePiece.src = match.image;
@@ -484,7 +485,8 @@
           image.width = 200;
           const caption = document.createElement("figcaption");
           caption.textContent = `${rank + 1}. ${match.title} (${match.year}) · ${match.training_label}${shotText(match)} · ${clock(match.timestamp_seconds)} · frame ${match.frame_number} · similarity ${match.score.toFixed(3)}`
-            + (match.confirmed ? ` · ✓ ${match.points} matching points` : "");
+            + (match.confirmed ? ` · ✓ ${match.points} matching points` : "")
+            + (match.match === "scene" ? " · same scene" : "");
           const link = document.createElement("a");
           link.href = match.full_image;
           link.textContent = "full size";

@@ -13,6 +13,7 @@ loss are real). `clip_from_video` gives the real footage when a file exists.
 
     from curtain_ml.encodings import RECIPES, encode
     image = encode("stream_h264", frames, index, random.Random(0))
+    clip = encode("stream_h264", frames, None, random.Random(0))  # every frame
 """
 
 from __future__ import annotations
@@ -73,86 +74,106 @@ def height(rng: random.Random, choices: list[int]) -> str:
 
 # ------------------------------------------------------------------ recipes
 # Each takes the clip, the target's position in it and a seeded rng, and
-# returns the target frame as it comes out.
+# returns the target frame as it comes out; with index None, every frame.
 
-Recipe = Callable[[list[Image.Image], int, random.Random], Image.Image]
+Recipe = Callable[[list[Image.Image], int | None, random.Random], Image.Image | list[Image.Image]]
+
+
+def pick(frames: list[Image.Image], index: int | None) -> Image.Image | list[Image.Image]:
+    return frames if index is None else frames[index]
+
+
+def per_frame(recipe: Callable) -> Recipe:
+    # An image recipe: on a whole clip, each frame on its own.
+    def run(frames, index, rng):
+        if index is None:
+            return [recipe(frames, i, rng) for i in range(len(frames))]
+        return recipe(frames, index, rng)
+    run.__name__ = recipe.__name__
+    return run
 
 
 def stream_h264(frames, index, rng):
     # Low and middle tiers of a streaming service or a pirate stream site.
-    return transcode(frames, ["-c:v", "libx264", "-preset", "fast", "-tune", "film",
+    return pick(transcode(frames, ["-c:v", "libx264", "-preset", "fast", "-tune", "film",
                               "-crf", str(rng.randint(26, 34)), "-pix_fmt", "yuv420p"],
-                     "mp4", vf=height(rng, [360, 480, 540]) if rng.random() < 0.5 else EVEN)[index]
+                     "mp4", vf=height(rng, [360, 480, 540]) if rng.random() < 0.5 else EVEN), index)
 
 
 def stream_hevc(frames, index, rng):
-    return transcode(frames, ["-c:v", "libx265", "-preset", "fast", "-x265-params", "log-level=error",
+    return pick(transcode(frames, ["-c:v", "libx265", "-preset", "fast", "-x265-params", "log-level=error",
                               "-crf", str(rng.randint(28, 36)), "-pix_fmt", "yuv420p"],
-                     "mp4", vf=height(rng, [480, 540]) if rng.random() < 0.5 else EVEN)[index]
+                     "mp4", vf=height(rng, [480, 540]) if rng.random() < 0.5 else EVEN), index)
 
 
 def stream_av1_grain(frames, index, rng):
     # AV1 with grain synthesis, as Netflix ships it: the real grain is
     # denoised away and a synthetic one painted back on.
-    return transcode(frames, ["-c:v", "libsvtav1", "-preset", "8", "-crf", str(rng.randint(40, 52)),
+    return pick(transcode(frames, ["-c:v", "libsvtav1", "-preset", "8", "-crf", str(rng.randint(40, 52)),
                               "-svtav1-params", f"film-grain={rng.randint(6, 14)}:film-grain-denoise=1",
-                              "-pix_fmt", "yuv420p"], "mkv")[index]
+                              "-pix_fmt", "yuv420p"], "mkv"), index)
 
 
 def youtube_vp9(frames, index, rng):
     # A film clip on YouTube, watched at 360p or 480p.
-    return transcode(frames, ["-c:v", "libvpx-vp9", "-deadline", "realtime", "-cpu-used", "8",
+    return pick(transcode(frames, ["-c:v", "libvpx-vp9", "-deadline", "realtime", "-cpu-used", "8",
                               "-crf", str(rng.randint(36, 46)), "-b:v", "0", "-pix_fmt", "yuv420p"],
-                     "webm", vf=height(rng, [360, 480]))[index]
+                     "webm", vf=height(rng, [360, 480])), index)
 
 
 def dvd_mpeg2(frames, index, rng):
     # Anamorphic 720x480 MPEG-2 at DVD bitrates, shown at 854x480.
-    return transcode(frames, ["-c:v", "mpeg2video", "-b:v", f"{rng.randint(3, 6)}M", "-maxrate", "9M",
+    return pick(transcode(frames, ["-c:v", "mpeg2video", "-b:v", f"{rng.randint(3, 6)}M", "-maxrate", "9M",
                               "-bufsize", "1835k", "-g", "15", "-bf", "2", "-pix_fmt", "yuv420p"],
                      "mpg", vf="scale=720:480:flags=bicubic,setsar=32/27",
-                     decode_vf="scale=854:480:flags=bicubic,setsar=1")[index]
+                     decode_vf="scale=854:480:flags=bicubic,setsar=1"), index)
 
 
 def upscaled_sharpened(frames, index, rng):
     # A small copy blown up and sharpened: "4K remaster" uploads and AI upscales.
     low = rng.choice([270, 360])
-    return transcode(frames, ["-c:v", "libx264", "-preset", "fast", "-crf", "20", "-pix_fmt", "yuv420p"],
+    return pick(transcode(frames, ["-c:v", "libx264", "-preset", "fast", "-crf", "20", "-pix_fmt", "yuv420p"],
                      "mp4", vf=f"scale=-2:{low}:flags=bilinear,scale=-2:{low * 3}:flags=lanczos,"
-                               f"unsharp=5:5:{rng.uniform(0.8, 1.6):.2f}")[index]
+                               f"unsharp=5:5:{rng.uniform(0.8, 1.6):.2f}"), index)
 
 
 def gif(frames, index, rng):
     # A reaction GIF: small, 256 colours, dithered.
     width = rng.choice([320, 400, 480])
     dither = rng.choice(["bayer:bayer_scale=3", "sierra2_4a", "floyd_steinberg", "none"])
-    return transcode(frames, [], "gif", vf=f"scale={width}:-1:flags=lanczos,split[a][b];"
-                                           f"[a]palettegen=stats_mode=diff[p];[b][p]paletteuse=dither={dither}")[index]
+    return pick(transcode(frames, [], "gif", vf=f"scale={width}:-1:flags=lanczos,split[a][b];"
+                                           f"[a]palettegen=stats_mode=diff[p];[b][p]paletteuse=dither={dither}"), index)
 
 
 def tv_range(frames, index, rng):
     # Player screenshot that never expanded limited range: grey blacks, dim whites.
-    x = np.asarray(stream_h264(frames, index, rng), dtype=np.float32)
-    return Image.fromarray(np.round(16 + x * 219 / 255).astype(np.uint8))
+    def squeeze(image):
+        x = np.asarray(image, dtype=np.float32)
+        return Image.fromarray(np.round(16 + x * 219 / 255).astype(np.uint8))
+    out = stream_h264(frames, index, rng)
+    return [squeeze(f) for f in out] if index is None else squeeze(out)
 
 
 def wrong_matrix(frames, index, rng):
     # HD video decoded with the SD colour matrix (or the reverse): a hue shift.
     pair = rng.choice(["bt709:bt601", "bt601:bt709"])
-    return transcode(frames, ["-c:v", "libx264", "-preset", "fast", "-crf", "23", "-pix_fmt", "yuv420p"],
-                     "mp4", decode_vf=f"colormatrix={pair}")[index]
+    return pick(transcode(frames, ["-c:v", "libx264", "-preset", "fast", "-crf", "23", "-pix_fmt", "yuv420p"],
+                     "mp4", decode_vf=f"colormatrix={pair}"), index)
 
 
+@per_frame
 def twitter(frames, index, rng):
     image = fit(frames[index], rng.choice([680, 1200, 2048]))
     return still(image, "JPEG", quality=85, subsampling="4:2:0", progressive=True)
 
 
+@per_frame
 def reddit_preview(frames, index, rng):
     image = fit(frames[index], rng.choice([640, 960]))
     return still(image, "WEBP", quality=rng.randint(70, 85))
 
 
+@per_frame
 def whatsapp(frames, index, rng):
     image = fit(frames[index], 1600)
     return still(image, "JPEG", quality=rng.randint(45, 70), subsampling="4:2:0")
@@ -160,10 +181,12 @@ def whatsapp(frames, index, rng):
 
 def reupload_chain(frames, index, rng):
     # Screenshot of a stream, then passed around: three or four sites in a row.
-    image = stream_h264(frames, index, rng)
-    for site in rng.sample([twitter, reddit_preview, whatsapp, twitter, whatsapp], rng.randint(3, 4)):
-        image = site([image], 0, rng)
-    return image
+    def chain(image):
+        for site in rng.sample([twitter, reddit_preview, whatsapp, twitter, whatsapp], rng.randint(3, 4)):
+            image = site([image], 0, rng)
+        return image
+    out = stream_h264(frames, index, rng)
+    return [chain(f) for f in out] if index is None else chain(out)
 
 
 RECIPES: dict[str, Recipe] = {
@@ -183,7 +206,8 @@ RECIPES: dict[str, Recipe] = {
 }
 
 
-def encode(name: str, frames: list[Image.Image], index: int, rng: random.Random) -> Image.Image:
+def encode(name: str, frames: list[Image.Image], index: int | None, rng: random.Random
+           ) -> Image.Image | list[Image.Image]:
     return RECIPES[name](frames, index, rng)
 
 

@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import math
+from typing import NamedTuple
+
 import numpy
 import torch
 import torch.nn.functional as functional
@@ -54,6 +57,28 @@ def _text_bank(size: int, count: int = 96, seed: int = 7) -> torch.Tensor:
     return torch.stack(bank).float().div_(255)
 
 
+class PaddedFrames(NamedTuple):
+    """Frames of mixed sizes in one zero-padded uint8 [N, 3, H, W] tensor
+    (each at the top left) and their [N, 2] (height, width). Built on the CPU
+    (in DataLoader workers: see pad_frames), it is pinned and copied to the
+    GPU in one transfer instead of one blocking copy per frame."""
+    pixels: torch.Tensor
+    sizes: torch.Tensor
+
+
+def pad_frames(images: list[torch.Tensor]) -> PaddedFrames:
+    if not images:
+        raise ValueError("Cannot augment an empty image batch")
+    if any(image.ndim != 3 or image.shape[0] != 3 for image in images):
+        raise ValueError("Expected RGB tensors shaped [3, height, width]")
+    sizes = torch.tensor([image.shape[1:] for image in images], dtype=torch.int32)
+    height, width = sizes.amax(dim=0).tolist()
+    pixels = torch.zeros((len(images), 3, height, width), dtype=torch.uint8)
+    for index, image in enumerate(images):
+        pixels[index, :, : image.shape[1], : image.shape[2]] = image
+    return PaddedFrames(pixels, sizes)
+
+
 class GpuCombinedAugmenter:
     """Create global and local positive pairs entirely on an accelerator.
 
@@ -66,10 +91,12 @@ class GpuCombinedAugmenter:
     (20-35% of the frame) or its 60% corner pieces is 0.5-1.4 of an index tile;
     with 0.6-1.4 tight crops found the exact frame 22 of 40 times.
     paired=True: the batch is (frame, neighbour) pairs; both get the same tile.
+    web_colour=True: half the damaged query-side views also get a web regrade
+    (see _web_grade), far outside the lighting changes above.
     """
 
     def __init__(self, image_size: int = 192, grid_size: int = 4, hard: bool = False,
-                 tight: bool = False):
+                 tight: bool = False, web_colour: bool = False):
         if image_size < 1:
             raise ValueError("Image size must be positive")
         if grid_size < 2:
@@ -78,7 +105,15 @@ class GpuCombinedAugmenter:
         self.grid_size = grid_size
         self.hard = hard
         self.tight = tight
+        self.web_colour = web_colour
         self.bank = _text_bank(image_size) if hard else None
+        self._bank_device: torch.Tensor | None = None  # bank on the training device, made once
+
+    def compile(self) -> None:
+        """torch.compile _appearance, the long chain of per-pixel steps on the
+        192 px views: they fuse into a few kernels instead of dozens of passes
+        over every view. Shapes are fixed per run (view count, image size)."""
+        self._appearance = torch.compile(self._appearance, dynamic=False)
 
     @staticmethod
     def _uniform(
@@ -90,28 +125,12 @@ class GpuCombinedAugmenter:
         return torch.empty(count, device=device).uniform_(low, high)
 
     def _padded_batch(
-        self, images: list[torch.Tensor], device: torch.device
+        self, frames: PaddedFrames, device: torch.device
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        if not images:
-            raise ValueError("Cannot augment an empty image batch")
-        if any(image.ndim != 3 or image.shape[0] != 3 for image in images):
-            raise ValueError("Expected RGB tensors shaped [3, height, width]")
-        heights = torch.tensor(
-            [image.shape[1] for image in images], device=device, dtype=torch.float32
-        )
-        widths = torch.tensor(
-            [image.shape[2] for image in images], device=device, dtype=torch.float32
-        )
-        maximum_height = int(heights.max().item())
-        maximum_width = int(widths.max().item())
-        batch = torch.zeros(
-            (len(images), 3, maximum_height, maximum_width),
-            device=device,
-            dtype=torch.uint8,
-        )
-        for index, image in enumerate(images):
-            height, width = image.shape[1:]
-            batch[index, :, :height, :width].copy_(image, non_blocking=True)
+        # Asynchronous when the loader pinned the pixels; sizes are CPU-side.
+        batch = frames.pixels.to(device, non_blocking=True)
+        sizes = frames.sizes.to(device=device, dtype=torch.float32, non_blocking=True)
+        heights, widths = sizes.unbind(dim=1)
         working_dtype = torch.float16 if device.type == "cuda" else torch.float32
         return batch.to(working_dtype), heights, widths
 
@@ -127,16 +146,15 @@ class GpuCombinedAugmenter:
         device = heights.device
         count = len(heights)
         draw = torch.rand(count, device=device)
-        fractions = torch.ones(count, device=device)
-
         mild = (draw >= 0.20) & (draw < 0.45)
         off_center = (draw >= 0.45) & (draw < 0.75)
         strong = draw >= 0.75
-        fractions[mild] = self._uniform(int(mild.sum()), 0.85, 1.0, device)
-        fractions[off_center] = self._uniform(
-            int(off_center.sum()), 0.70, 0.90, device
-        )
-        fractions[strong] = self._uniform(int(strong.sum()), 0.60, 0.70, device)
+        # Each family's range by elementwise selection (no counts or boolean
+        # indexing: those wait for the GPU): full 1, mild 0.85-1, off-center
+        # 0.70-0.90, strong 0.60-0.70.
+        low = torch.where(mild, 0.85, torch.where(off_center, 0.70, torch.where(strong, 0.60, 1.0)))
+        high = torch.where(mild, 1.0, torch.where(off_center, 0.90, torch.where(strong, 0.70, 1.0)))
+        fractions = low + (high - low) * torch.rand(count, device=device)
 
         crop_widths = widths * fractions
         crop_heights = heights * fractions
@@ -252,47 +270,47 @@ class GpuCombinedAugmenter:
         return functional.conv2d(padded, kernel, groups=3)
 
     def _overlay(self, images: torch.Tensor) -> torch.Tensor:
-        """Subtitles or a logo (35%), or a phone/player UI bar (10%), on [0, 1] views."""
+        """Subtitles or a logo (35%), or a phone/player UI bar (10%), on [0, 1] views.
+
+        Every view is computed and masked with torch.where (no .any() branches
+        or boolean indexing): no device syncs, and torch.compile sees one graph."""
         device = images.device
         count = len(images)
         draw = torch.rand(count, device=device)
-        text = draw < 0.35
-        if text.any():
-            bank = self.bank.to(device=device, dtype=images.dtype)
-            pick = bank[torch.randint(len(bank), (int(text.sum()),), device=device)]
-            alpha = pick[:, 3:4]
-            images[text] = images[text] * (1 - alpha) + pick[:, :3] * alpha
+        text = (draw < 0.35)[:, None, None, None]
+        if self._bank_device is None or self._bank_device.device != device \
+                or self._bank_device.dtype != images.dtype:
+            self._bank_device = self.bank.to(device=device, dtype=images.dtype)
+        pick = self._bank_device[torch.randint(len(self._bank_device), (count,), device=device)]
+        alpha = pick[:, 3:4]
+        images = torch.where(text, images * (1 - alpha) + pick[:, :3] * alpha, images)
         bar = (draw >= 0.35) & (draw < 0.45)
-        if bar.any():
-            rows = torch.arange(self.image_size, device=device)[None, :]
-            height = (self._uniform(count, 0.03, 0.10, device) * self.image_size)[:, None]
-            top = torch.rand(count, device=device)[:, None] < 0.5
-            covered = torch.where(top, rows < height, rows >= self.image_size - height) & bar[:, None]
-            shade = torch.where(torch.rand(count, device=device) < 0.7, 0.0, 0.95).to(images.dtype)
-            images = torch.where(covered[:, None, :, None], shade[:, None, None, None], images)
-        return images
+        rows = torch.arange(self.image_size, device=device)[None, :]
+        height = (self._uniform(count, 0.03, 0.10, device) * self.image_size)[:, None]
+        top = torch.rand(count, device=device)[:, None] < 0.5
+        covered = torch.where(top, rows < height, rows >= self.image_size - height) & bar[:, None]
+        shade = torch.where(torch.rand(count, device=device) < 0.7, 0.0, 0.95).to(images.dtype)
+        return torch.where(covered[:, None, :, None], shade[:, None, None, None], images)
 
     def _texture(self, images: torch.Tensor, clean: torch.Tensor) -> torch.Tensor:
         """Film grain (30%) or sharpening (15%), not on clean views."""
         device = images.device
         count = len(images)
         draw = torch.rand(count, device=device)
+        # Both computed for every view and masked (see _overlay).
         grain = (draw < 0.30) & ~clean
-        if grain.any():
-            # Grain is a few pixels across: noise at half size, upsampled;
-            # strongest in the mid-tones.
-            half = self.image_size // 2
-            noise = torch.randn(count, 1, half, half, device=device, dtype=images.dtype)
-            noise = functional.interpolate(noise, size=(self.image_size,) * 2, mode="bilinear")
-            amount = self._uniform(count, 0.01, 0.05, device).to(images.dtype)[:, None, None, None]
-            weight = 4 * images.mean(dim=1, keepdim=True) * (1 - images.mean(dim=1, keepdim=True))
-            images = torch.where(grain[:, None, None, None], (images + noise * amount * (0.4 + weight)).clamp(0, 1), images)
+        # Grain is a few pixels across: noise at half size, upsampled;
+        # strongest in the mid-tones.
+        half = self.image_size // 2
+        noise = torch.randn(count, 1, half, half, device=device, dtype=images.dtype)
+        noise = functional.interpolate(noise, size=(self.image_size,) * 2, mode="bilinear")
+        amount = self._uniform(count, 0.01, 0.05, device).to(images.dtype)[:, None, None, None]
+        weight = 4 * images.mean(dim=1, keepdim=True) * (1 - images.mean(dim=1, keepdim=True))
+        images = torch.where(grain[:, None, None, None], (images + noise * amount * (0.4 + weight)).clamp(0, 1), images)
         sharpen = (draw >= 0.30) & (draw < 0.45) & ~clean
-        if sharpen.any():
-            amount = self._uniform(count, 0.3, 1.0, device).to(images.dtype)[:, None, None, None]
-            sharp = (images + (images - self._blur(images)) * amount).clamp(0, 1)
-            images = torch.where(sharpen[:, None, None, None], sharp, images)
-        return images
+        amount = self._uniform(count, 0.3, 1.0, device).to(images.dtype)[:, None, None, None]
+        sharp = (images + (images - self._blur(images)) * amount).clamp(0, 1)
+        return torch.where(sharpen[:, None, None, None], sharp, images)
 
     def _appearance(self, images: torch.Tensor, overlay: bool = False) -> torch.Tensor:
         """Apply lighting, blur, degradation, quantization, and normalization
@@ -358,6 +376,9 @@ class GpuCombinedAugmenter:
         images = torch.where(
             greyscale[:, None, None, None], luma(images).expand_as(images), images
         )
+        if self.web_colour and overlay:
+            graded = (torch.rand(count, device=device) < 0.5) & ~clean
+            images = torch.where(graded[:, None, None, None], self._web_grade(images, luma), images)
 
         blur_mask = ((torch.rand(count, device=device) < 0.20) & ~clean)[
             :, None, None, None
@@ -403,29 +424,61 @@ class GpuCombinedAugmenter:
         std = images.new_tensor(IMAGENET_STD)[None, :, None, None]
         return images.sub_(mean).div_(std).contiguous(memory_format=torch.channels_last)
 
+    def _web_grade(self, images: torch.Tensor, luma) -> torch.Tensor:
+        """A regraded release or a re-saved web copy: saturation 0.35-4.5x
+        (log-uniform), brightness 0.7-1.9x, per-channel gain 0.75-1.25, then
+        faded up to 30% toward a random tint (lifted, coloured blacks). A web
+        Clockwork Orange frame had 4.5x our frame's saturation, 1.7x its
+        brightness, blacks at 0.29 not 0.08 and 0.77x the blue; the right frame
+        ranked 1622nd."""
+        count, device = len(images), images.device
+        saturation = torch.empty(count, device=device).uniform_(math.log(0.35), math.log(4.5)).exp()
+        brightness = self._uniform(count, 0.7, 1.9, device)
+        gain = torch.empty(count, 3, device=device).uniform_(0.75, 1.25)
+        fade = self._uniform(count, 0.0, 0.3, device)[:, None, None, None]
+        tint = torch.empty(count, 3, 1, 1, device=device).uniform_(0.2, 0.8)
+        gray = luma(images)
+        images = gray + (images - gray) * saturation[:, None, None, None]
+        images = (images * brightness[:, None, None, None] * gain[:, :, None, None]).clamp(0, 1)
+        return images * (1 - fade) + tint * fade
+
     @staticmethod
-    def same_pairs(batch: torch.Tensor, heights: torch.Tensor, widths: torch.Tensor) -> torch.Tensor:
+    def same_pairs(batch: torch.Tensor, height: int, width: int) -> torch.Tensor:
         """[pairs] bool: a (frame, neighbour) pair that is the same picture (a
         static shot: no 1/48-frame block changes by more than 6 levels of 255),
-        which no model can tell apart, so is not used as a negative."""
-        h, w = int(heights.min()), int(widths.min())
-        small = functional.adaptive_avg_pool2d(batch[:, :, :h, :w].float().mean(dim=1, keepdim=True), (27, 48))
+        which no model can tell apart, so is not used as a negative. height,
+        width: the smallest frame's (Python ints, so no device sync)."""
+        small = functional.adaptive_avg_pool2d(batch[:, :, :height, :width].float().mean(dim=1, keepdim=True), (27, 48))
         return (small[0::2] - small[1::2]).abs().amax(dim=(1, 2, 3)) <= 6
 
     @torch.no_grad()
     def __call__(
-        self, images: list[torch.Tensor], device: torch.device | str, paired: bool = False
+        self, images: list[torch.Tensor] | PaddedFrames, device: torch.device | str, paired: bool = False,
+        queries: list[torch.Tensor] | PaddedFrames | None = None,
     ) -> tuple[torch.Tensor, ...]:
         """Return full/global and exact/shifted local view pairs; with paired,
-        also same_pairs for the batch's (frame, neighbour) pairs."""
+        also same_pairs for the batch's (frame, neighbour) pairs. images: a
+        list of [3, H, W] uint8 frames, or them already padded (pad_frames).
+        queries: a copy of each image (same size) to crop the query-side views
+        (global, shifted) from, e.g. one put through a codec (curtain_ml.codec_pool)."""
         device = torch.device(device)
+        images = images if isinstance(images, PaddedFrames) else pad_frames(images)
         batch, heights, widths = self._padded_batch(images, device)
+        query_batch = batch
+        if queries is not None:
+            queries = queries if isinstance(queries, PaddedFrames) else pad_frames(queries)
+            if not torch.equal(queries.sizes, images.sizes):
+                raise ValueError("Each query copy must have its image's size")
+            query_batch = self._padded_batch(queries, device)[0]
         full_boxes = self._full_boxes(heights, widths)
         global_boxes = self._global_boxes(heights, widths)
         exact_boxes, shifted_boxes = self._tile_boxes(heights, widths, paired)
         views = tuple(
-            self._appearance(self._crop_resize(batch, boxes), overlay)
-            for boxes, overlay in ((full_boxes, False), (global_boxes, True),
-                                   (exact_boxes, False), (shifted_boxes, True))
+            self._appearance(self._crop_resize(source, boxes), overlay)
+            for source, boxes, overlay in ((batch, full_boxes, False), (query_batch, global_boxes, True),
+                                           (batch, exact_boxes, False), (query_batch, shifted_boxes, True))
         )
-        return (*views, self.same_pairs(batch, heights, widths)) if paired else views
+        if not paired:
+            return views
+        height, width = images.sizes.amin(dim=0).tolist()
+        return (*views, self.same_pairs(batch, height, width))

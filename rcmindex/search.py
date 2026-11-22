@@ -26,6 +26,7 @@ from rcmindex import shots
 # The index the site and benchmarks search; CURTAIN_FAISS_DIR picks another
 # (build_faiss.py --out), e.g. one built from a new model's arrays.
 FAISS_DIR = Path(os.environ.get("CURTAIN_FAISS_DIR", Path(__file__).resolve().parents[1] / ".local/faiss"))
+EXCLUSIONS_FILE = Path(os.environ.get("CURTAIN_SOURCE_EXCLUSIONS", Path(__file__).with_name("excluded_sources.json")))
 # On-disk copy of tiles4-global-ivf16384-pq32.faiss (rcmindex/ondisk_faiss.py):
 # its inverted lists (~14 GB of PQ codes and ids) live in the .ivfdata file
 # beside it and are memory-mapped, so they sit in the page cache, not the heap.
@@ -252,7 +253,12 @@ def load(directory: Path = FAISS_DIR, nprobe: int = 64) -> dict:
     faiss.extract_index_ivf(index).nprobe = nprobe
     movies = catalog["movies"]
     names = FrameNames(movies, catalog.pop("names"))
+    excluded = json.loads(EXCLUSIONS_FILE.read_text())
+    if not isinstance(excluded, dict) or not all(isinstance(k, str) and isinstance(v, str) for k,v in excluded.items()):
+        raise ValueError('Source exclusions must map collection/movie names to reasons')
     return {
+        "excluded_sources": excluded,
+        "active_movies": np.array([m['movie'] not in excluded for m in movies], dtype=bool),
         "shot": shot_ids(movies),
         "index": index,
         "names": names,
@@ -263,6 +269,19 @@ def load(directory: Path = FAISS_DIR, nprobe: int = 64) -> dict:
         "tiles": [np.load(m["tiles"], mmap_mode="r") for m in movies],
         "whole": [np.load(m["global"], mmap_mode="r") for m in movies],
     }
+
+
+def active_frames(engine: dict, frames: np.ndarray) -> np.ndarray:
+    """Keep stable stored frame IDs while excluding audited bad source spans."""
+    active = engine.get('active_movies')
+    if active is None:
+        return frames
+    movie = np.searchsorted(engine['firsts'], frames, side='right') - 1
+    return frames[active[movie]]
+
+
+def frame_active(engine: dict, index: int) -> bool:
+    return bool(len(active_frames(engine, np.array([index], dtype=np.int64))))
 
 
 def frame_vectors(engine: dict, frames: np.ndarray) -> np.ndarray:
@@ -306,7 +325,7 @@ def neighbours(engine: dict, frames: np.ndarray, reach: int = NEIGHBOURS) -> np.
     movie = np.searchsorted(engine["firsts"], frames, side="right") - 1
     near = [np.clip(frames + d, engine["firsts"][movie], engine["ends"][movie] - 1)
             for d in range(-reach, reach + 1)]
-    return np.unique(np.concatenate(near))
+    return active_frames(engine, np.unique(np.concatenate(near)))
 
 
 def candidate_frames(engine: dict, queries: np.ndarray | list[np.ndarray],
@@ -320,7 +339,7 @@ def candidate_frames(engine: dict, queries: np.ndarray | list[np.ndarray],
     readings = queries if isinstance(queries, list) else [queries]
     readings = [np.ascontiguousarray(q, dtype=np.float32) for q in readings]
     _, ids = engine["index"].search(np.concatenate(readings), count)  # one batch for all views
-    frames = np.unique(ids[ids >= 0] // engine["stride"])
+    frames = active_frames(engine, np.unique(ids[ids >= 0] // engine["stride"]))
     if len(frames) == 0:
         return frames, np.empty(0, dtype=np.float32)
 

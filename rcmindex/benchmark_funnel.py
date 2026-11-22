@@ -32,6 +32,7 @@ from curtain_ml.model import CurtainEncoder
 from rcmindex import align, search
 from rcmindex.benchmark_int8 import queries
 from rcmindex.validation_suite import LOCAL, SOURCES, browser_upload, embed, score, timestamps
+from rcmindex.data_paths import WEBP
 
 FIRST, MOST = 10, 40  # apps/server.py ALIGN_FIRST, ALIGN_CANDIDATES
 SETTINGS = {"old": (128, False, False), "wide": (512, False, True),
@@ -61,7 +62,7 @@ def main() -> None:
         collection, rest = engine["names"][frame].split("/", 1)
         path = SOURCES[collection] / rest
         if not path.is_file():
-            path = (LOCAL / "frames-small" / collection / rest).with_suffix(".webp")
+            path = (WEBP / collection / rest).with_suffix(".webp")
         return path if path.is_file() else None
 
     rows = []

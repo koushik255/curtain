@@ -55,6 +55,7 @@ from curtain_ml import encodings
 from rcmindex import shots
 from curtain_ml.model import CurtainEncoder
 from curtain_ml.training import reference_transform
+from rcmindex.data_paths import ORIGINAL_DIRS
 
 ROOT = Path(__file__).resolve().parents[1]
 LOCAL = ROOT / ".local"
@@ -63,7 +64,7 @@ SUITES = {"validation": SUITE, "encodings": LOCAL / "benchmarks/encodings-v1",
           "stacked": LOCAL / "benchmarks/stacked-v1"}
 NEIGHBOURS = 4  # frames either side of the target in an encodings clip
 RESULTS = LOCAL / "benchmarks/results"
-SOURCES = {"full-curtain": LOCAL / "screenshots", "l4-50k-lbfive": Path.home() / "lbfive/screenshots"}
+SOURCES = ORIGINAL_DIRS
 OLD_INDEXES = {"full-curtain": LOCAL / "trained_indexes/l4-50k-crop-v1",
                "l4-50k-lbfive": LOCAL / "trained_indexes/l4-50k-lbfive-crop-v1"}
 # Validation movies of both checkpoints (their split.json files agree).

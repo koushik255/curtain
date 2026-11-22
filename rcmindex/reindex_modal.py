@@ -33,7 +33,7 @@ from pathlib import Path
 import modal
 
 ROOT = Path(__file__).resolve().parents[1]
-VOLUME = "curtain-reindex"  # frames/<collection>/<movie>.tar, model/, out/<model>/<batch>/
+VOLUME = "curtain-reindex"  # indexed_movies_640p/<collection>/<movie>.tar, trained_models_onnx/, index_outputs/<model>/<batch>/
 UPLOADS = 4  # movies uploading at once
 
 app = modal.App("curtain-reindex")
@@ -52,7 +52,7 @@ image = (
 @app.function(image=image, gpu="L4", cpu=8, memory=32768, timeout=2 * 60 * 60,
               volumes={"/vol": volume}, retries=1)
 def index_batch(name: str, movies: list[str], model: str) -> int:
-    """Index movies ("<collection>/<movie>") into /vol/out/<model>/<name>; returns frames indexed."""
+    """Index movies ("<collection>/<movie>") into /vol/index_outputs/<model>/<name>; returns frames indexed."""
     import shutil
 
     volume.reload()
@@ -61,19 +61,26 @@ def index_batch(name: str, movies: list[str], model: str) -> int:
     for movie in movies:
         target = work / "frames" / movie
         target.mkdir(parents=True)
-        tar_path = Path(f"/vol/frames/{movie}.tar")
+        tar_path = Path(f"/vol/indexed_movies_640p/{movie}.tar")
         if not tar_path.exists():  # a validation film compare_models_modal.py uploaded
-            tar_path = Path(f"/vol/bench/{movie.split('/')[1]}.tar")
+            tar_path = Path(f"/vol/indexed_movies_fullres/{movie}.tar")
+        if not tar_path.exists():  # a film not in the index yet (index_unindexed_modal.py)
+            tar_path = Path(f"/vol/unindexed_movies_640p/{movie.split('/')[1]}.tar")
         with tarfile.open(tar_path) as tar:
             tar.extractall(target, filter="data")
     # rcmindex caches its TensorRT engine beside the model, so a local copy.
-    shutil.copytree(f"/vol/model/{model}", work / "model")
+    shutil.copytree(f"/vol/trained_models_onnx/{model}", work / "model")
     dirs = "".join(f"{work / 'frames' / movie}\n" for movie in movies)
     out = work / "out"
     subprocess.run(["/rcmindex/build/rcmindex", "--model", str(work / "model"), "--movies-from", "-",
                     "--global", "--output", str(out)], input=dirs, text=True, check=True,
                    stdout=subprocess.DEVNULL)
-    shutil.copytree(out, f"/vol/out/{model}/{name}", dirs_exist_ok=True)
+    shutil.copytree(out, f"/vol/index_outputs/{model}/{name}", dirs_exist_ok=True)
+    # Keep the TensorRT engines rcmindex built (trunk_b*_s*.plan, minutes each) so
+    # the next container loads them; same image and GPU type, so they stay valid.
+    for plan in (work / "model").glob("*.plan"):
+        if not Path(f"/vol/trained_models_onnx/{model}/{plan.name}").exists():
+            shutil.copy(plan, f"/vol/trained_models_onnx/{model}/{plan.name}")
     volume.commit()
     return sum(json.loads(p.read_text())["frames"] for p in out.glob("*/*.json")
                if not p.name.endswith(".records.json"))
@@ -107,12 +114,12 @@ def main() -> None:
             return volume.listdir(path, recursive=True)
         except (modal.exception.NotFoundError, FileNotFoundError):
             return []
-    uploaded = {e.path.removeprefix("frames/") for e in listing("frames") if e.path.endswith(".tar")}
-    uploaded |= {"full-curtain/" + e.path.removeprefix("bench/") for e in listing("bench") if e.path.endswith(".tar")}
+    uploaded = {e.path.removeprefix("indexed_movies_640p/") for e in listing("indexed_movies_640p") if e.path.endswith(".tar")}
+    uploaded |= {e.path.removeprefix("indexed_movies_fullres/") for e in listing("indexed_movies_fullres") if e.path.endswith(".tar")}
     model = args.model.name
-    if not listing(f"model/{model}"):
+    if not listing(f"trained_models_onnx/{model}"):
         with volume.batch_upload(force=True) as batch:
-            batch.put_directory(str(args.model), f"/model/{model}")
+            batch.put_directory(str(args.model), f"/trained_models_onnx/{model}")
         say(f"uploaded model {model}")
 
     def upload(movie: str) -> int:
@@ -126,16 +133,16 @@ def main() -> None:
         size = buffer.tell()
         buffer.seek(0)
         with volume.batch_upload(force=True) as batch:
-            batch.put_file(buffer, f"/frames/{movie}.tar")
+            batch.put_file(buffer, f"/indexed_movies_640p/{movie}.tar")
         return size
 
     def download(name: str, call: modal.FunctionCall) -> None:
         frames = call.get()
         local = args.out / name
-        for entry in volume.listdir(f"out/{model}/{name}", recursive=True):
+        for entry in volume.listdir(f"index_outputs/{model}/{name}", recursive=True):
             if entry.type != modal.volume.FileEntryType.FILE:
                 continue
-            path = local / entry.path.removeprefix(f"out/{model}/{name}/")
+            path = local / entry.path.removeprefix(f"index_outputs/{model}/{name}/")
             path.parent.mkdir(parents=True, exist_ok=True)
             with open(path.with_suffix(path.suffix + ".part"), "wb") as f:
                 for chunk in volume.read_file(entry.path):

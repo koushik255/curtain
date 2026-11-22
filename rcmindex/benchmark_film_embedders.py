@@ -29,8 +29,9 @@ from curtain_ml.model import CurtainEncoder
 from rcmindex import search
 from rcmindex.compare_models import frame_vectors
 from rcmindex.validation_suite import LOCAL, QUERY_TYPES, browser_upload, embed
+from rcmindex.data_paths import WEBP
 
-FRAMES = LOCAL / "frames-small/l4-50k-lbfive"
+FRAMES = WEBP / "l4-50k-lbfive"
 CACHE = LOCAL / "film-embedders"
 CURRENT = Path(__file__).resolve().parents[1] / "curtain_models/all-films-v1/best.pt"
 # all-films-v1's index of the film, as rcmindex wrote it (49 tiles + .global).
@@ -107,7 +108,7 @@ def embed_frames(model, paths: list[Path]) -> np.ndarray:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("film", help="folder under .local/frames-small/l4-50k-lbfive")
+    parser.add_argument("film", help="folder under .local/data/frames/webp/l4-50k-lbfive")
     parser.add_argument("--per-type", type=int, default=20)
     parser.add_argument("--frames", type=int, default=None, help="only the film's first N frames (CPU time)")
     parser.add_argument("--seed", type=int, default=7)

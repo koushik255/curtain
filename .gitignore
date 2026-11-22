@@ -61,3 +61,6 @@ Thumbs.db
 /.agents/
 /.codex/
 rcmindex/build/
+
+# curtain_lab experiment outputs (extracted frames, embedding caches, galleries)
+/curtain_lab/results/

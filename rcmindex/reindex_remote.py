@@ -1,7 +1,7 @@
 """Re-index every catalog movie with a new model on another machine's GPU.
 
 In batches of --batch movies: copy their frames over ssh (the originals where
-they are still whole, else the 640 px WebP copies in .local/frames-small/),
+they are still whole, else the 640 px WebP copies in .local/data/frames/webp/),
 run rcmindex there, copy the arrays back into --out/batch-NNN/, and delete
 the remote copies (never the local frames). The next batch copies while the
 current one indexes. Resumable: movies whose report is already in --out are
@@ -21,9 +21,10 @@ import time
 from pathlib import Path
 
 from rcmindex.search import FAISS_DIR
+from rcmindex.data_paths import WEBP
 from rcmindex.validation_suite import LOCAL, SOURCES
 
-SMALL = LOCAL / "frames-small"
+SMALL = WEBP
 REMOTE = "reindex"  # under the remote home: frames/<collection>/<movie>, out/batch-NNN
 started = time.monotonic()
 

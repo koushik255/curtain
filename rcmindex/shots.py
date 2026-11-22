@@ -20,11 +20,12 @@ import time
 from pathlib import Path
 
 import numpy as np
+from rcmindex.data_paths import ORIGINAL_DIRS, WEBP
 
 ROOT = Path(__file__).resolve().parents[1]
 SHOTS = ROOT / ".local/shots"
-FRAME_DIRS = {"full-curtain": ROOT / ".local/screenshots", "l4-50k-lbfive": Path.home() / "lbfive/screenshots"}
-SMALL_FRAMES = ROOT / ".local/frames-small"
+FRAME_DIRS = ORIGINAL_DIRS
+SMALL_FRAMES = WEBP
 CUT = 0.6
 
 

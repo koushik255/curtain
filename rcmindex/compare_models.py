@@ -10,12 +10,14 @@ Needs a GPU; the frame embeddings are cached per checkpoint under
 .local/compare-models/.
 
     .venv/bin/python -m rcmindex.compare_models OLD.pt NEW.pt --extra 30
+    .venv/bin/python -m rcmindex.compare_models OLD.pt NEW.pt --suite stacked
 """
 
 from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -29,7 +31,7 @@ from curtain_ml.training import IMAGENET_MEAN, IMAGENET_STD
 from rcmindex import search
 from rcmindex.benchmark_int8 import queries
 from rcmindex.export_model import GRID, STEPS, trunk_of
-from rcmindex.validation_suite import LOCAL, SOURCES, VALIDATION, browser_upload, embed
+from rcmindex.validation_suite import LOCAL, SOURCES, SUITES, VALIDATION, browser_upload, embed
 
 CACHE = LOCAL / "compare-models"
 BATCH = 16
@@ -76,9 +78,17 @@ def main() -> None:
     parser.add_argument("checkpoints", nargs="+", type=Path)
     parser.add_argument("--extra", type=int, default=30, help="fresh queries per type on top of the suite")
     parser.add_argument("--seed", type=int, default=11)
+    parser.add_argument("--suite", choices=list(SUITES), help="only this suite's queries (no --extra)")
     args = parser.parse_args()
     device = torch.device("cuda")
-    items = queries(args.extra, args.seed)
+    if args.suite:
+        folder = SUITES[args.suite]
+        manifest = json.loads((folder / "manifest.json").read_text())["queries"]
+        items = [(q["type"], Image.open(folder / q["image"]).convert("RGB"), q["target"]) for q in manifest]
+        streams = [f"stream {q['steps']['stream']}" if "steps" in q else None for q in manifest]
+    else:
+        items = queries(args.extra, args.seed)
+        streams = [None] * len(items)
     print(f"{len(items)} queries", flush=True)
     paths = {m: sorted((SOURCES["full-curtain"] / m).glob("*.jpg")) for m in VALIDATION}
     report = {}
@@ -96,7 +106,7 @@ def main() -> None:
             vectors[movie] = torch.from_numpy(np.load(cache)).to(device)
         rows = []
         model = model.cpu()
-        for kind, image, target in items:
+        for (kind, image, target), stream in zip(items, streams):
             movie, name = target.split("/")[1:]
             image = browser_upload(image)
             q = embed(model, [image, *search.pieces(image)])
@@ -105,11 +115,12 @@ def main() -> None:
             score = torch.maximum(best[:, 0] - search.WHOLE_HANDICAP, best.mean(dim=1))
             index = [p.name for p in paths[movie]].index(name)
             rank = int((score > score[index]).sum()) + 1
-            rows.append((kind, rank, float(score[index])))
+            rows.append((kind, rank, float(score[index]), stream))
         model = model.to(device)
         report[checkpoint] = rows
 
     kinds = list(dict.fromkeys(kind for kind, _, _ in items))
+    kinds += sorted(set(streams) - {None})
     names = [c.parent.name for c in args.checkpoints]
     print("\n| type | " + " | ".join(f"{n} #1" for n in names) + " | " + " | ".join(f"{n} median rank" for n in names)
           + " | " + " | ".join(f"{n} true score" for n in names) + " |")
@@ -118,7 +129,7 @@ def main() -> None:
         cells = []
         for metric in ("first", "rank", "score"):
             for c in args.checkpoints:
-                sub = [r for r in report[c] if kind in ("ALL", r[0])]
+                sub = [r for r in report[c] if kind in ("ALL", r[0], r[3])]
                 if metric == "first":
                     cells.append(f"{sum(r[1] == 1 for r in sub)}/{len(sub)}")
                 elif metric == "rank":

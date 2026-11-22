@@ -25,6 +25,8 @@ from curtain_ml.retrieval import normalize_rows
 from curtain_ml.provenance import LABELS, EXPLANATION, category, load_split, movie_key
 from rcmindex import align
 from rcmindex import search as tile_search
+from rcmindex.film_aliases import canonical
+from rcmindex.data_paths import ORIGINAL_DIRS, WEBP
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -34,11 +36,8 @@ DEFAULT_CHECKPOINT = Path(os.environ.get("CURTAIN_CHECKPOINT",
                                          LOCAL_ROOT / "trained_models/combined-rocm-50k-v1/best.pt"))
 # Frame folders per index collection, and the older per-frame records that
 # carry timestamps.
-FRAME_ROOTS = {
-    "full-curtain": LOCAL_ROOT / "screenshots",
-    "l4-50k-lbfive": Path("/home/koushik/lbfive/screenshots"),
-}
-SMALL_FRAMES = LOCAL_ROOT / "frames-small"  # <collection>/<movie>/<frame>.webp
+FRAME_ROOTS = ORIGINAL_DIRS
+SMALL_FRAMES = WEBP  # <collection>/<movie>/<frame>.webp
 TIMESTAMP_RECORDS = {
     "full-curtain": LOCAL_ROOT / "trained_indexes/l4-50k-crop-v1",
     "l4-50k-lbfive": LOCAL_ROOT / "trained_indexes/l4-50k-lbfive-crop-v1",
@@ -59,6 +58,13 @@ RESULTS = 20
 # Override with CURTAIN_ALIGN_CANDIDATES.
 ALIGN_FIRST = 10
 ALIGN_CANDIDATES = int(os.environ.get("CURTAIN_ALIGN_CANDIDATES", 40))
+# Scene search (rcmindex/scene_search.py): after the confirmed matches, the
+# films with the most similar scene, for screenshots of moments we don't have
+# (stills, other angles). Off unless CURTAIN_SCENE_INDEX names an index folder;
+# CURTAIN_SCENE_MODEL is "pretrained" or a scene.pt checkpoint.
+SCENE_INDEX = os.environ.get("CURTAIN_SCENE_INDEX")
+SCENE_MODEL = os.environ.get("CURTAIN_SCENE_MODEL", "pretrained")
+WEAK_POINTS = 30  # with_scenes: a confirmed match under this may be a shared set
 # Search by shot (the page's toggle): the best SHOT_FRAMES frames, one per
 # shot (rcmindex.shots), so the results are ALIGN_CANDIDATES different shots
 # instead of runs of neighbouring frames. On The Godfather Part II (200
@@ -136,15 +142,16 @@ class TrainedSearchEngine:
             if old.exists():
                 timestamps = {r["filename"]: r["timestamp_seconds"] for r in json.loads(old.read_text())}
 
-            key = movie_key(name)
+            film = canonical(name)  # rcmindex/film_aliases.json: duplicates list as one film
+            key = movie_key(film)
             movie = known.get(key)
             if movie is None:
-                title, separator, year = name.rpartition("_")
+                title, separator, year = film.rpartition("_")
                 if not separator or not year.isdigit():
-                    title, year = name, ""
-                status = category(name, split)
+                    title, year = film, ""
+                status = category(film, split)
                 movie = {
-                    "id": name,
+                    "id": film,
                     "title": title.replace("_", " "),
                     "year": int(year) if year else None,
                     "frames": 0,
@@ -154,7 +161,8 @@ class TrainedSearchEngine:
                 }
                 known[key] = movie
                 self.movies.append(movie)
-                self.movie_lookup[name] = movie
+            self.movie_lookup[name] = movie
+            self.movie_lookup.setdefault(film, movie)
             movie["spans"].append((start, count))
             movie["frames"] += count
             entries.append((movie["id"], source))
@@ -169,11 +177,27 @@ class TrainedSearchEngine:
         if not self.records:
             raise RuntimeError("No frames loaded.")
         self.vectors = self.search_index["index"].ntotal
+        active_spans = {(entry['first'], entry['frames']) for entry, active in
+                        zip(self.search_index['movies'], self.search_index['active_movies']) if active}
+        for movie in self.movies:
+            movie['spans'] = [span for span in movie['spans'] if span in active_spans]
+            movie['frames'] = sum(count for _, count in movie['spans'])
+            movie['active'] = bool(movie['spans'])
+        self.movies = [movie for movie in self.movies if movie['active']]
+        self.searchable_frames = sum(movie['frames'] for movie in self.movies)
         self.catalog = [dict(movie, active=True) for movie in self.movies]
+        self.scene = None
+        if SCENE_INDEX:
+            from rcmindex.scene_search import SceneSearch
+            self.scene = SceneSearch(Path(SCENE_INDEX), SCENE_MODEL)
+            # Scene films by folder name, searchable sources only (not excluded_sources.json).
+            self.film_source = {entry["movie"].split("/", 1)[1]: entry["movie"] for entry, active in
+                                zip(self.search_index["movies"], self.search_index["active_movies"]) if active}
 
     def public_result(self, index: int, score: float,
                       alignment: tuple[int, list[float] | None, tuple[int, int]] | None = None,
-                      query_size: tuple[int, int] | None = None, shots: bool = False) -> dict:
+                      query_size: tuple[int, int] | None = None, shots: bool = False,
+                      scene: bool = False) -> dict:
         # Convert an internal matrix row into the JSON shown by the web UI.
         record = dict(self.records[index])
         if alignment:
@@ -193,6 +217,8 @@ class TrainedSearchEngine:
                       image=url_for("frame_image", index=index, w=640),
                       thumbnail=url_for("frame_image", index=index, w=320),
                       full_image=url_for("frame_image", index=index))
+        if scene:  # a frame of the same scene, not this exact moment
+            record["match"] = "scene"
         if shots:
             first, last = tile_search.shot_span(self.search_index, index)
             record.update(shot_start_seconds=self.records[first]["timestamp_seconds"],
@@ -228,14 +254,14 @@ class TrainedSearchEngine:
             "retrieval_ms": (searched - embedded) * 1000,
             "frames_per_second": len(self.records) / (searched - embedded),
         }
-        results = [self.public_result(*entry, image.size, shots=shots) for entry in ranked]
+        results = [self.public_result(*entry[:3], image.size, shots=shots, scene=len(entry) > 3) for entry in ranked]
         top = results[0] if results else None
         yield {
             "type": "result",
             "result": top,
             "results": results,
             # Confirmed by alignment, or a high similarity score.
-            "weak": not top or (not top["confirmed"] and top["score"] < WEAK_SCORE),
+            "weak": not top or (not top.get("confirmed") and top["score"] < WEAK_SCORE),
             "timings": {
                 "decode_ms": (decoded - started) * 1000,
                 "embedding_ms": (embedded - decoded) * 1000,
@@ -280,7 +306,39 @@ class TrainedSearchEngine:
                              readings)
         if shots:  # refine may bring in a neighbour from a shot already listed
             ranked = tile_search.by_shot(self.search_index, ranked)
+        if self.scene is not None:
+            ranked = self.with_scenes(image, ranked)
         return ranked[:RESULTS], searched
+
+    def with_scenes(self, image: Image.Image, ranked: list[tuple]) -> list[tuple]:
+        # The confirmed matches, then one frame of each film the scene search
+        # ranks highest (marked "scene"), then the rest of the frame matches.
+        # A weak confirmed match (under WEAK_POINTS) whose film isn't among the
+        # scene's top 3 is usually the wrong film (a shared set or texture):
+        # then the scene's best film goes first and that match second
+        # (benchmarks/scene_variants.py: web misses' #1 69 -> 86, online-v1 414 -> 415).
+        confirmed = [e for e in ranked if e[2] and e[2][0] >= align.VERIFIED_POINTS]
+        scenes = [s for s in self.scene.search(image, top=RESULTS + 5) if s[0] in self.film_source]
+        scene_films = list(dict.fromkeys(canonical(s[0]) for s in scenes))
+        out, shown = [], set()
+
+        def add_scene(film: str, score: float, frame_file: str) -> None:
+            if canonical(film) in shown:
+                return
+            index = self.frame_index(f"{self.film_source[film]}/{Path(frame_file).stem}.jpg")
+            if index is not None:
+                out.append((index, score, None, "scene"))
+                shown.add(canonical(film))
+
+        if confirmed and scenes and confirmed[0][2][0] < WEAK_POINTS \
+                and self.records[confirmed[0][0]]["movie"] not in scene_films[:3]:
+            add_scene(*scenes[0])
+        for e in confirmed:
+            out.append(e)
+            shown.add(self.records[e[0]]["movie"])
+        for s in scenes:
+            add_scene(*s)
+        return out + [e for e in ranked if e not in confirmed and self.records[e[0]]["movie"] not in shown]
 
     def locate(self, query: align.Features, index: int) -> tuple:
         # Where the upload sits in a frame: (agreeing points, matrix or None, frame size).
@@ -329,11 +387,14 @@ class TrainedSearchEngine:
         if source not in self.source_spans:
             return None
         start, count = self.source_spans[source]
-        return self.search_index["names"].find(start, count, filename)
+        index = self.search_index["names"].find(start, count, filename)
+        return index if index is not None and tile_search.frame_active(self.search_index, index) else None
 
     def frame_path(self, index: int) -> Path | None:
         # Resolve a safe local source path for an indexed frame row.
         if not 0 <= index < len(self.records):
+            return None
+        if not tile_search.frame_active(self.search_index, index):
             return None
         record = self.records[index]
         root, folder = self.source_dirs[record.get('source', record['movie'])]
@@ -343,7 +404,7 @@ class TrainedSearchEngine:
             return None
         if candidate.is_file():
             return candidate
-        # Original pruned: its 640 px WebP copy in .local/frames-small/.
+        # Original pruned: its 640 px WebP copy in .local/data/frames/webp/.
         small = SMALL_FRAMES / record.get("source", record["movie"]) / (Path(record["filename"]).stem + ".webp")
         return small if small.is_file() else None
 
@@ -390,7 +451,7 @@ def home():
 @app.get("/api/health")
 def health():
     # Return a lightweight readiness and index-size check.
-    return jsonify(status="ready", movies=len(engine.movies), frames=len(engine.records),
+    return jsonify(status="ready", movies=len(engine.movies), frames=engine.searchable_frames,
                    vectors=engine.vectors, model="Curtain ResNet-18 · combined tiles")
 
 
@@ -483,6 +544,8 @@ def thumbnail(path: Path, width: int) -> bytes:
 def frame_image(index: int):
     # Serve one validated source frame by its internal index row; ?w=320|640
     # returns a smaller copy.
+    if not 0 <= index < len(engine.records) or not tile_search.frame_active(engine.search_index, index):
+        return jsonify(error="Frame not found."), 404
     path = engine.frame_path(index)
     if path is None:
         if not 0 <= index < len(engine.records):
@@ -506,7 +569,7 @@ def gallery():
               "unseen": "Unseen by training/validation"}
     if group not in groups:
         return jsonify(error="Unknown image group."), 400
-    if selected and selected not in engine.movie_lookup:
+    if selected and (selected not in engine.movie_lookup or not engine.movie_lookup[selected]['active']):
         return jsonify(error="Movie not found."), 404
     movie_list = [engine.movie_lookup[selected]] if selected else engine.movies
     if group != "all":

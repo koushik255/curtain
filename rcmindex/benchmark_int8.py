@@ -38,6 +38,7 @@ from curtain_ml.model import CurtainEncoder
 from rcmindex import align, search
 from rcmindex.validation_suite import (LOCAL, QUERY_TYPES, SOURCES, SUITE, VALIDATION, browser_upload,
                                        embed, score, timestamps)
+from rcmindex.data_paths import WEBP
 
 ALIGN_TOP = 10
 
@@ -109,7 +110,7 @@ def main() -> None:
                 collection, rest = engine["names"][frame].split("/", 1)
                 path = SOURCES[collection] / rest
                 if not path.is_file():
-                    path = (LOCAL / "frames-small" / collection / rest).with_suffix(".webp")
+                    path = (WEBP / collection / rest).with_suffix(".webp")
                 if not path.is_file():
                     return 0
                 return align.align(query, align.frame_features(path))[0]
